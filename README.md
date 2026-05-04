@@ -1,3 +1,7 @@
+<p align="left">
+  <img src="assets/contorch-orange.png" width="96" alt="Contorch logo">
+</p>
+
 # pipeline-monitor
 
 > Part of **Contorch** — the persistent context layer for Claude Code.

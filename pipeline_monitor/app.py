@@ -25,10 +25,21 @@ from . import status as st
 from .smoketest import run_smoke_test
 
 REFRESH_INTERVAL_S = 5
+PULSE_INTERVAL_S = 0.5
 
-ICON_RECORDING = "● REC"
-ICON_OK = "○"
-ICON_ERR = "⚠"
+# Icon assets live alongside the package, two levels up from app.py
+# (repo_root/assets/) so the build-menubar-icons script can regenerate
+# them without touching the package itself.
+ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
+GLYPH_TEMPLATE = ASSETS_DIR / "glyph-template.png"
+GLYPH_TEMPLATE_PULSE = ASSETS_DIR / "glyph-template-pulse.png"
+GLYPH_REC = ASSETS_DIR / "glyph-rec.png"
+
+# Fallback title text used only if the asset PNGs are missing (e.g. a
+# user installed from an older release before icons existed).
+ICON_FALLBACK_RECORDING = "● REC"
+ICON_FALLBACK_OK = "○"
+ICON_FALLBACK_ERR = "⚠"
 
 
 def _ago(iso_or_seconds) -> str:
@@ -212,10 +223,33 @@ def _open_dir_callback(path: Path):
 
 class PipelineMonitor(rumps.App):
     def __init__(self):
-        super().__init__("pipeline-monitor", title=ICON_OK, quit_button=None)
+        # Use the template glyph if available; otherwise fall back to text.
+        # template=True tells macOS to auto-tint for light/dark menu bars.
+        if GLYPH_TEMPLATE.exists():
+            super().__init__(
+                "pipeline-monitor",
+                icon=str(GLYPH_TEMPLATE),
+                template=True,
+                quit_button=None,
+            )
+            self._has_icons = True
+        else:
+            super().__init__(
+                "pipeline-monitor",
+                title=ICON_FALLBACK_OK,
+                quit_button=None,
+            )
+            self._has_icons = False
+
         self._snap: Optional[st.Snapshot] = None
+        self._pulse_phase = 0  # 0 = base glyph, 1 = bolder pulse glyph
+        self._is_pulsing = False
+
         self.refresh_timer = rumps.Timer(self._refresh_callback, REFRESH_INTERVAL_S)
         self.refresh_timer.start()
+        # Pulse timer is only started when we enter recording state.
+        self.pulse_timer = rumps.Timer(self._pulse_tick, PULSE_INTERVAL_S)
+
         self._refresh_callback(None)  # initial sync paint
 
     # ----- callbacks -----
@@ -268,6 +302,30 @@ class PipelineMonitor(rumps.App):
     def _on_quit(self, _):
         rumps.quit_application()
 
+    # ----- pulse animation (recording state only) -----
+
+    def _start_pulse(self):
+        if self._is_pulsing or not self._has_icons:
+            return
+        self._is_pulsing = True
+        self._pulse_phase = 0
+        self.pulse_timer.start()
+
+    def _stop_pulse(self):
+        if not self._is_pulsing:
+            return
+        self._is_pulsing = False
+        self.pulse_timer.stop()
+        # Reset to the base template glyph.
+        if self._has_icons:
+            self.icon = str(GLYPH_TEMPLATE)
+
+    def _pulse_tick(self, _):
+        if not self._has_icons:
+            return
+        self._pulse_phase = 1 - self._pulse_phase
+        self.icon = str(GLYPH_TEMPLATE_PULSE if self._pulse_phase else GLYPH_TEMPLATE)
+
     # ----- repaint -----
 
     def _repaint(self):
@@ -277,11 +335,16 @@ class PipelineMonitor(rumps.App):
 
         overall = snap.overall()
         if overall == "rec":
-            self.title = ICON_RECORDING
+            # Start the pulse animation; title carries the REC text so
+            # users can confirm at a glance even if the pulse is subtle.
+            self._start_pulse()
+            self.title = " REC" if self._has_icons else ICON_FALLBACK_RECORDING
         elif overall == "err":
-            self.title = ICON_ERR
+            self._stop_pulse()
+            self.title = " ⚠" if self._has_icons else ICON_FALLBACK_ERR
         else:
-            self.title = ICON_OK
+            self._stop_pulse()
+            self.title = "" if self._has_icons else ICON_FALLBACK_OK
 
         # Tear down + rebuild menu — simpler than diffing
         self.menu.clear()

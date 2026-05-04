@@ -1,5 +1,7 @@
 # pipeline-monitor
 
+> Part of **Contorch** — the persistent context layer for Claude Code.
+
 macOS menu bar app for the meeting-capture + context-orchestrator pipeline.
 
 Glanceable state in the menu bar — `○` idle / `● REC` recording / `⚠` something broken — and a six-section dashboard when you click it.

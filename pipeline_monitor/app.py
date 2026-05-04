@@ -32,19 +32,28 @@ ICON_ERR = "⚠"
 
 
 def _ago(iso_or_seconds) -> str:
-    """Human-friendly 'X ago' for an ISO timestamp or age in seconds."""
+    """Human-friendly 'X ago' for an ISO timestamp or age in seconds.
+
+    SQLite's `datetime('now')` returns UTC strings with no timezone info.
+    Treat any naive timestamp as UTC (not local) so we don't end up with
+    negative ages on machines whose local clock is behind UTC.
+    """
+    from datetime import timezone
     if iso_or_seconds is None:
         return "never"
     if isinstance(iso_or_seconds, (int, float)):
         s = int(iso_or_seconds)
     else:
         try:
-            # Strip Z suffix if present
-            s_str = str(iso_or_seconds).replace("Z", "+00:00")
+            s_str = str(iso_or_seconds).replace("Z", "+00:00").replace(" ", "T")
             dt = datetime.fromisoformat(s_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             s = int(time.time() - dt.timestamp())
         except Exception:
             return str(iso_or_seconds)[:19]
+    if s < 0:
+        return "just now"  # clock skew safety
     if s < 60:
         return f"{s}s ago"
     if s < 3600:
@@ -120,8 +129,12 @@ def _build_mcp_section(snap: st.Snapshot) -> list[rumps.MenuItem]:
     if not m.get("ok"):
         items.append(rumps.MenuItem(f"  ⚠ MCP log: {_truncate(m.get('error', '?'), 40)}"))
         return items
-    alive = "✓ alive" if m.get("alive") else "✗ stale"
-    items.append(rumps.MenuItem(f"  MCP server: {alive} (log {_ago(m.get('log_age_s'))})"))
+    # "Active" if log was touched in last 10 min; else "idle" (not "stale" —
+    # MCP servers don't write to log unless tools are being called, so silence
+    # just means Claude Code isn't actively asking it for anything).
+    log_age = m.get("log_age_s", 9999)
+    activity = "active" if log_age < 600 else "idle"
+    items.append(rumps.MenuItem(f"  MCP server: {activity} · last log {_ago(log_age)}"))
     last = m.get("last_call")
     if last:
         result_emoji = {"ok": "✓", "fail": "✗", "pending": "…"}.get(last.get("result"), "?")
@@ -131,7 +144,10 @@ def _build_mcp_section(snap: st.Snapshot) -> list[rumps.MenuItem]:
         ))
     else:
         items.append(rumps.MenuItem("  Last call: (none yet)"))
-    if m.get("last_error"):
+    # Only surface the most-recent error if it was actually the last call
+    # (i.e. the failure is current). If a later call succeeded, the error
+    # is historical and we don't want to alarm anyone.
+    if m.get("last_error") and last and last.get("result") == "fail":
         items.append(rumps.MenuItem(f"  ⚠ Last error: {_truncate(m['last_error'], 60)}"))
 
     # Auto-context hook

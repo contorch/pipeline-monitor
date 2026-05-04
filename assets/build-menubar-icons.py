@@ -25,13 +25,18 @@ SRC = ASSETS / "contorch-orange.png"
 TARGET_SIZE = 44  # 22pt @ 2x retina
 
 
-def load_silhouette(threshold: int = 32) -> Image.Image:
-    """Take the source PNG, return a black-on-transparent silhouette."""
-    src = Image.open(SRC).convert("RGBA")
-    # Use the alpha channel as the mask. Anything sufficiently opaque
-    # becomes solid black; the rest stays transparent.
-    alpha = src.split()[-1]
-    mask = alpha.point(lambda v: 255 if v >= threshold else 0)
+def load_silhouette(white_cutoff: int = 230) -> Image.Image:
+    """Take the source PNG, return a black-on-transparent silhouette.
+
+    The source PNG from ChatGPT's image generator is RGB (no alpha) —
+    its "transparent" background is actually solid white pixels. So we
+    can't use the alpha channel as a mask; we have to detect the
+    background by luminance. Any pixel below `white_cutoff` luminance
+    becomes opaque black, everything brighter becomes transparent.
+    """
+    src = Image.open(SRC).convert("RGB")
+    luma = src.convert("L")
+    mask = luma.point(lambda v: 255 if v < white_cutoff else 0)
     out = Image.new("RGBA", src.size, (0, 0, 0, 0))
     black_layer = Image.new("RGBA", src.size, (0, 0, 0, 255))
     out.paste(black_layer, (0, 0), mask)
@@ -58,8 +63,9 @@ def make_template():
 
 
 def make_template_pulse():
-    """Recording-state second frame — slightly bolder via dilation."""
-    sil = load_silhouette(threshold=16)  # lower threshold = thicker mask
+    """Recording-state second frame — slightly bolder via a higher
+    cutoff that catches the soft anti-aliased edges."""
+    sil = load_silhouette(white_cutoff=245)  # higher cutoff = thicker mask
     out = fit(sil, TARGET_SIZE)
     out.save(ASSETS / "glyph-template-pulse.png")
     print(f"wrote {ASSETS / 'glyph-template-pulse.png'} ({out.size})")

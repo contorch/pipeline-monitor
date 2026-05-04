@@ -81,129 +81,164 @@ def _truncate(s: str, n: int = 60) -> str:
 
 
 # ============================================================ menu builders
+#
+# Design principles for the redesigned menu:
+#   - One line per concept, not three
+#   - No section headers — separators are enough
+#   - Hide deep detail (timelines, daemon PIDs, paths) behind submenus
+#   - Status glyphs only when something's wrong (●/✓/✗/⚠), not as bullets
+#   - All previous functionality still reachable, just one click deeper
 
-def _build_now_section(snap: st.Snapshot) -> list[rumps.MenuItem]:
-    items = []
+def _build_status_line(snap: st.Snapshot) -> rumps.MenuItem:
+    """Top of menu — recording state. Visible at a glance."""
     rec = snap.recording
     if not rec.get("ok"):
-        items.append(rumps.MenuItem(f"Recording: ? ({_truncate(rec.get('error', 'unknown'), 40)})"))
-    elif rec.get("recording"):
-        items.append(rumps.MenuItem("● RECORDING"))
-        if rec.get("current_file"):
-            items.append(rumps.MenuItem(f"  → {Path(rec['current_file']).name}"))
-    else:
-        items.append(rumps.MenuItem("○ idle"))
-    return items
+        return rumps.MenuItem(f"⚠ {_truncate(rec.get('error', 'unknown'), 50)}")
+    if rec.get("recording"):
+        f = rec.get("current_file")
+        if f:
+            return rumps.MenuItem(f"● Recording — {Path(f).name}")
+        return rumps.MenuItem("● Recording")
+    return rumps.MenuItem("○ Idle")
 
 
-def _build_recent_section(snap: st.Snapshot) -> list[rumps.MenuItem]:
-    items = []
-    r = snap.recordings
-    if not r.get("ok"):
-        items.append(rumps.MenuItem(f"  (no transcripts dir)"))
-        return items
-    sessions = r.get("sessions", [])
-    if not sessions:
-        items.append(rumps.MenuItem("  (no recordings yet)"))
-        return items
-    items.append(rumps.MenuItem(f"  {r['total_count']} total · {len(sessions)} shown"))
-    for sess in sessions[:10]:
-        size_kb = sess["size"] / 1024
-        title = f"  {sess['name']} ({size_kb:.0f}KB · {_ago(sess['age_s'])})"
-        mi = rumps.MenuItem(_truncate(title, 70), callback=_open_path_callback(sess["path"]))
-        items.append(mi)
-    return items
-
-
-def _build_index_section(snap: st.Snapshot) -> list[rumps.MenuItem]:
-    items = []
+def _build_index_line(snap: st.Snapshot) -> rumps.MenuItem:
+    """One line summarising the chroma + sqlite state."""
     c = snap.chroma
     d = snap.db
-    if c.get("ok"):
-        items.append(rumps.MenuItem(
-            f"  Chroma: {c.get('doc_count', '?')} docs @ {c.get('dim', '?')}d"
-        ))
-    else:
-        items.append(rumps.MenuItem(f"  ⚠ Chroma: {_truncate(c.get('error', 'unreachable'), 40)}"))
+    if not c.get("ok"):
+        return rumps.MenuItem(f"⚠ Index: {_truncate(c.get('error', 'unreachable'), 50)}")
+    parts = [f"{c.get('doc_count', '?')} docs"]
     if d.get("ok"):
-        items.append(rumps.MenuItem(
-            f"  SQLite: {d.get('tasks', 0)} tasks · {d.get('sources', 0)} sources · {d.get('repo_knowledge', 0)} insights"
-        ))
+        parts.append(f"{d.get('repo_knowledge', 0)} insights")
         if d.get("last_repo_knowledge"):
-            items.append(rumps.MenuItem(f"  Last insight: {_ago(d['last_repo_knowledge'])}"))
-    else:
-        items.append(rumps.MenuItem(f"  ⚠ SQLite: {_truncate(d.get('error', '?'), 40)}"))
-    return items
+            parts.append(f"last {_ago(d['last_repo_knowledge'])}")
+    return rumps.MenuItem("Index: " + " · ".join(parts))
 
 
-def _build_mcp_section(snap: st.Snapshot) -> list[rumps.MenuItem]:
+def _build_mcp_lines(snap: st.Snapshot) -> list[rumps.MenuItem]:
+    """Two lines: MCP server activity, auto-context hook activity.
+    Last-tool-call detail goes into the timeline submenu."""
     items = []
     m = snap.mcp
-    if not m.get("ok"):
-        items.append(rumps.MenuItem(f"  ⚠ MCP log: {_truncate(m.get('error', '?'), 40)}"))
-        return items
-    # "Active" if log was touched in last 10 min; else "idle" (not "stale" —
-    # MCP servers don't write to log unless tools are being called, so silence
-    # just means Claude Code isn't actively asking it for anything).
-    log_age = m.get("log_age_s", 9999)
-    activity = "active" if log_age < 600 else "idle"
-    items.append(rumps.MenuItem(f"  MCP server: {activity} · last log {_ago(log_age)}"))
-    last = m.get("last_call")
-    if last:
-        result_emoji = {"ok": "✓", "fail": "✗", "pending": "…"}.get(last.get("result"), "?")
-        lat = f" {last['latency_ms']}ms" if last.get("latency_ms") else ""
-        items.append(rumps.MenuItem(
-            f"  Last call: {result_emoji} {last['tool']}{lat} · {_ago(last.get('ts'))}"
-        ))
-    else:
-        items.append(rumps.MenuItem("  Last call: (none yet)"))
-    # Only surface the most-recent error if it was actually the last call
-    # (i.e. the failure is current). If a later call succeeded, the error
-    # is historical and we don't want to alarm anyone.
-    if m.get("last_error") and last and last.get("result") == "fail":
-        items.append(rumps.MenuItem(f"  ⚠ Last error: {_truncate(m['last_error'], 60)}"))
-
-    # Auto-context hook
     h = snap.hook
-    if h.get("ok"):
-        lat = f" {h['latency_ms']}ms" if h.get("latency_ms") else ""
-        chars = f" · {h['injected_chars']}c" if h.get("injected_chars") else ""
-        items.append(rumps.MenuItem(
-            f"  Auto-context hook: {_ago(h.get('age_s'))}{lat}{chars}"
-        ))
-    else:
-        items.append(rumps.MenuItem(f"  Auto-context hook: {_truncate(h.get('error', '?'), 50)}"))
 
-    # Tool-call timeline submenu
-    timeline = rumps.MenuItem("  → Tool-call timeline (last 20)")
-    for c in reversed(m.get("recent_calls", [])):
-        emoji = {"ok": "✓", "fail": "✗", "pending": "…"}.get(c.get("result"), "?")
-        lat = f" {c['latency_ms']}ms" if c.get("latency_ms") else ""
-        timeline.add(rumps.MenuItem(f"  {emoji} {c['tool']}{lat} · {_ago(c.get('ts'))}"))
-    items.append(timeline)
+    # MCP line
+    if not m.get("ok"):
+        items.append(rumps.MenuItem(f"⚠ MCP: {_truncate(m.get('error', '?'), 50)}"))
+    else:
+        last = m.get("last_call")
+        if last:
+            result_emoji = {"ok": "✓", "fail": "✗", "pending": "…"}.get(last.get("result"), "?")
+            items.append(rumps.MenuItem(
+                f"MCP: {result_emoji} {last['tool']} · {_ago(last.get('ts'))}"
+            ))
+        else:
+            items.append(rumps.MenuItem("MCP: idle (no calls yet)"))
+        # Surface a current failure prominently
+        if m.get("last_error") and last and last.get("result") == "fail":
+            items.append(rumps.MenuItem(f"⚠ {_truncate(m['last_error'], 60)}"))
+
+    # Hook line
+    if h.get("ok"):
+        items.append(rumps.MenuItem(f"Auto-context hook: {_ago(h.get('age_s'))}"))
+    else:
+        items.append(rumps.MenuItem(f"Auto-context hook: {_truncate(h.get('error', 'no fires yet'), 50)}"))
 
     return items
 
 
-def _build_system_section(snap: st.Snapshot) -> list[rumps.MenuItem]:
-    items = []
+def _build_system_line(snap: st.Snapshot) -> rumps.MenuItem:
+    """One line: are the daemons up?"""
+    l = snap.launchd
+    if not l.get("ok"):
+        return rumps.MenuItem(f"⚠ launchctl: {_truncate(l.get('error', '?'), 50)}")
+    daemons = l.get("daemons", {})
+    installed = [info for info in daemons.values() if info.get("installed")]
+    running = [info for info in installed if info.get("running")]
+    if len(running) == len(installed) and installed:
+        return rumps.MenuItem(f"Daemons: {len(running)}/{len(installed)} up")
+    down = len(installed) - len(running)
+    return rumps.MenuItem(f"⚠ Daemons: {down} down ({len(running)}/{len(installed)} up)")
+
+
+def _build_recent_submenu(snap: st.Snapshot) -> rumps.MenuItem:
+    """Submenu listing recent sessions. Click any to open."""
+    r = snap.recordings
+    sessions = r.get("sessions", []) if r.get("ok") else []
+    label = f"Recent sessions ({len(sessions)})" if sessions else "Recent sessions (none yet)"
+    submenu = rumps.MenuItem(label)
+    if not r.get("ok"):
+        submenu.add(rumps.MenuItem(f"⚠ {_truncate(r.get('error', '?'), 50)}"))
+        return submenu
+    if not sessions:
+        return submenu
+    for sess in sessions[:10]:
+        size_kb = sess["size"] / 1024
+        title = f"{sess['name']} · {size_kb:.0f}KB · {_ago(sess['age_s'])}"
+        submenu.add(rumps.MenuItem(_truncate(title, 70),
+                                   callback=_open_path_callback(sess["path"])))
+    return submenu
+
+
+def _build_tool_calls_submenu(snap: st.Snapshot) -> rumps.MenuItem:
+    """Submenu for the MCP tool-call timeline."""
+    m = snap.mcp
+    calls = m.get("recent_calls", []) if m.get("ok") else []
+    submenu = rumps.MenuItem(f"Tool calls ({len(calls)})" if calls else "Tool calls (none)")
+    for c in reversed(calls):
+        emoji = {"ok": "✓", "fail": "✗", "pending": "…"}.get(c.get("result"), "?")
+        lat = f" {c['latency_ms']}ms" if c.get("latency_ms") else ""
+        submenu.add(rumps.MenuItem(f"{emoji} {c['tool']}{lat} · {_ago(c.get('ts'))}"))
+    return submenu
+
+
+def _build_details_submenu(snap: st.Snapshot) -> rumps.MenuItem:
+    """Submenu containing per-daemon PIDs, disk usage, and other detail
+    that's useful but doesn't deserve top-level pixels."""
+    submenu = rumps.MenuItem("Details")
+
+    # Per-daemon status
     l = snap.launchd
     if l.get("ok"):
         for label, info in l.get("daemons", {}).items():
             short = label.split(".")[-1]
             if not info.get("installed"):
-                items.append(rumps.MenuItem(f"  - {short}: not installed"))
+                submenu.add(rumps.MenuItem(f"– {short}: not installed"))
             elif info.get("running"):
-                items.append(rumps.MenuItem(f"  ✓ {short}: pid {info['pid']}"))
+                submenu.add(rumps.MenuItem(f"✓ {short} · pid {info['pid']}"))
             else:
-                items.append(rumps.MenuItem(f"  ✗ {short}: stopped (exit {info.get('status')})"))
-    else:
-        items.append(rumps.MenuItem(f"  ⚠ launchctl: {_truncate(l.get('error', '?'), 40)}"))
-    d = snap.disk
+                submenu.add(rumps.MenuItem(f"✗ {short} · stopped (exit {info.get('status')})"))
+        submenu.add(rumps.separator)
+
+    # Chroma dim
+    c = snap.chroma
+    if c.get("ok"):
+        submenu.add(rumps.MenuItem(f"Chroma: {c.get('doc_count')} docs @ {c.get('dim')}d"))
+
+    # SQLite breakdown
+    d = snap.db
     if d.get("ok"):
-        bits = " · ".join(f"{k}={v}" for k, v in d.get("dirs", {}).items())
-        items.append(rumps.MenuItem(f"  Disk: {bits}"))
-    return items
+        submenu.add(rumps.MenuItem(
+            f"SQLite: {d.get('tasks', 0)} tasks · {d.get('sources', 0)} sources · {d.get('repo_knowledge', 0)} insights"
+        ))
+
+    # Hook detail
+    h = snap.hook
+    if h.get("ok"):
+        lat = f" · {h['latency_ms']}ms" if h.get("latency_ms") else ""
+        chars = f" · {h['injected_chars']}c" if h.get("injected_chars") else ""
+        submenu.add(rumps.MenuItem(f"Hook: {_ago(h.get('age_s'))}{lat}{chars}"))
+
+    submenu.add(rumps.separator)
+
+    # Disk usage
+    disk = snap.disk
+    if disk.get("ok"):
+        for k, v in disk.get("dirs", {}).items():
+            submenu.add(rumps.MenuItem(f"{k}: {v}"))
+
+    return submenu
 
 
 def _open_path_callback(path: str):
@@ -385,43 +420,39 @@ class PipelineMonitor(rumps.App):
             self._stop_pulse()
             self.title = "" if self._has_icons else ICON_FALLBACK_OK
 
-        # Tear down + rebuild menu — simpler than diffing
+        # Tear down + rebuild menu — simpler than diffing.
+        # Layout: status line, separator, index summary, separator, MCP +
+        # hook lines, separator, daemon summary + 3 submenus, separator,
+        # actions. Headers are intentionally absent — separators do the
+        # grouping work without consuming a row each.
         self.menu.clear()
-        self.menu.add(rumps.MenuItem(f"Pipeline Monitor · {datetime.now().strftime('%H:%M:%S')}"))
+
+        self.menu.add(_build_status_line(snap))
         self.menu.add(rumps.separator)
 
-        self.menu.add(rumps.MenuItem("NOW"))
-        for it in _build_now_section(snap):
-            self.menu.add(it)
+        self.menu.add(_build_index_line(snap))
         self.menu.add(rumps.separator)
 
-        self.menu.add(rumps.MenuItem("RECENT SESSIONS"))
-        for it in _build_recent_section(snap):
-            self.menu.add(it)
+        for line in _build_mcp_lines(snap):
+            self.menu.add(line)
+        self.menu.add(_build_tool_calls_submenu(snap))
         self.menu.add(rumps.separator)
 
-        self.menu.add(rumps.MenuItem("INDEX HEALTH"))
-        for it in _build_index_section(snap):
-            self.menu.add(it)
+        self.menu.add(_build_system_line(snap))
+        self.menu.add(_build_recent_submenu(snap))
+        self.menu.add(_build_details_submenu(snap))
         self.menu.add(rumps.separator)
 
-        self.menu.add(rumps.MenuItem("MCP / CONNECTIONS"))
-        for it in _build_mcp_section(snap):
-            self.menu.add(it)
-        self.menu.add(rumps.separator)
-
-        self.menu.add(rumps.MenuItem("SYSTEM HEALTH"))
-        for it in _build_system_section(snap):
-            self.menu.add(it)
-        self.menu.add(rumps.separator)
-
-        self.menu.add(rumps.MenuItem("Refresh now", callback=self._on_refresh_now))
-        self.menu.add(rumps.MenuItem("Run end-to-end smoke test", callback=self._on_smoke_test))
-        self.menu.add(rumps.separator)
-        self.menu.add(rumps.MenuItem("Open transcripts folder", callback=self._on_open_transcripts))
-        self.menu.add(rumps.MenuItem("Open ~/.context-orchestrator", callback=self._on_open_co_dir))
-        self.menu.add(rumps.MenuItem("Open MCP log", callback=self._on_open_mcp_log))
-        self.menu.add(rumps.MenuItem("Restart chroma daemon", callback=self._on_restart_chroma))
+        # Actions — primary actions visible, secondary ones grouped into
+        # an "Open" submenu so the bottom of the menu doesn't sprawl.
+        self.menu.add(rumps.MenuItem("Refresh", callback=self._on_refresh_now))
+        self.menu.add(rumps.MenuItem("Run smoke test", callback=self._on_smoke_test))
+        open_submenu = rumps.MenuItem("Open")
+        open_submenu.add(rumps.MenuItem("Transcripts folder", callback=self._on_open_transcripts))
+        open_submenu.add(rumps.MenuItem("~/.context-orchestrator", callback=self._on_open_co_dir))
+        open_submenu.add(rumps.MenuItem("MCP log", callback=self._on_open_mcp_log))
+        self.menu.add(open_submenu)
+        self.menu.add(rumps.MenuItem("Restart chroma", callback=self._on_restart_chroma))
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Quit", callback=self._on_quit))
 

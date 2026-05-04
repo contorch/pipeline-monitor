@@ -258,7 +258,15 @@ def recordings_status(limit: int = 15) -> dict[str, Any]:
 # ----------------------------------------------------------- meeting-capture
 
 def recording_status() -> dict[str, Any]:
-    """Is meeting-capture currently recording? Heuristic: read its log tail."""
+    """Is meeting-capture currently recording? Heuristic: read its log tail.
+
+    meeting-capture daemon's actual log vocabulary (verified May 2026):
+      • `mic active — starting recording session`           → start
+      • `sysaudio: stream started, piping PCM to stdout`    → start (sub-event)
+      • `new session: meeting-2026-05-03T21-37-42.md`       → start (gives filename)
+      • `mic inactive — session ended`                      → stop
+    Walks the tail backwards and returns the most recent state event.
+    """
     out: dict[str, Any] = {"ok": False, "recording": False}
     if not MEETING_CAPTURE_LOG.exists():
         out["error"] = f"missing {MEETING_CAPTURE_LOG}"
@@ -266,25 +274,37 @@ def recording_status() -> dict[str, Any]:
     try:
         st = MEETING_CAPTURE_LOG.stat()
         out["log_age_s"] = int(time.time() - st.st_mtime)
-        # Read last ~16KB to find the most recent state event
         with MEETING_CAPTURE_LOG.open("rb") as f:
             f.seek(max(0, st.st_size - 16384))
             tail = f.read().decode("utf-8", errors="ignore")
         lines = tail.strip().splitlines()
-        # Look backwards for the most recent recording state hint
+
         recording = False
         current_file = None
+        last_session_filename: Optional[str] = None
         for line in reversed(lines):
             low = line.lower()
-            if "recording stopped" in low or "session ended" in low:
+            # STOP sentinels — definitive end-of-recording markers
+            if "session ended" in low or "recording stopped" in low or "shutting down" in low:
                 recording = False
                 break
-            if "recording started" in low or "session started" in low:
+            # START sentinels — any of these means we're mid-recording
+            if (
+                "mic active" in low
+                or "starting recording session" in low
+                or "sysaudio: stream started" in low
+                or "session started" in low
+                or low.startswith("new session:")
+                or " new session:" in low
+            ):
                 recording = True
-                # Try to extract file path
-                m = re.search(r"(/[^\s]+\.(?:wav|m4a|md))", line)
-                if m:
-                    current_file = m.group(1)
+                # Capture the filename from the "new session:" line if seen
+                # earlier in the tail (we walk backwards, so we may have
+                # already passed it). Look forward from this point for it.
+                if not current_file:
+                    m = re.search(r"new session:\s*(\S+\.md)", tail, re.IGNORECASE)
+                    if m:
+                        current_file = m.group(1)
                 break
         out["recording"] = recording
         out["current_file"] = current_file

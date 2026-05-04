@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Optional
 
 import rumps
+from AppKit import NSObject
+from PyObjCTools import AppHelper  # noqa: F401  (ensures AppKit init order)
 
 from . import status as st
 from .smoketest import run_smoke_test
@@ -219,6 +221,32 @@ def _open_dir_callback(path: Path):
     return _cb
 
 
+# ============================================================ menu delegate
+
+class _MenuOpenDelegate(NSObject):
+    """NSMenu delegate — fires a sync refresh right before the menu
+    appears, so the items the user sees are always current.
+
+    Without this, rumps' periodic refresh rebuilds the underlying
+    NSMenu items every 5s, but macOS only renders the dropdown at
+    open time. If you opened the menu, then started a recording, the
+    items would stay frozen on whatever was true at open time.
+    """
+
+    def initWithApp_(self, app):
+        self = self.init()
+        if self is None:
+            return None
+        self._app = app
+        return self
+
+    def menuWillOpen_(self, menu):
+        try:
+            self._app._refresh_callback(None)
+        except Exception:
+            pass
+
+
 # ============================================================ app
 
 class PipelineMonitor(rumps.App):
@@ -251,6 +279,17 @@ class PipelineMonitor(rumps.App):
         self.pulse_timer = rumps.Timer(self._pulse_tick, PULSE_INTERVAL_S)
 
         self._refresh_callback(None)  # initial sync paint
+
+        # Wire menuWillOpen so the dropdown shows fresh data even if the
+        # 5s timer hasn't fired since the user clicked. Has to be set
+        # AFTER the first repaint (which is the call above) because
+        # rumps doesn't materialize the underlying NSMenu until the
+        # first add().
+        self._menu_delegate = _MenuOpenDelegate.alloc().initWithApp_(self)
+        try:
+            self._menu._menu.setDelegate_(self._menu_delegate)
+        except Exception:
+            pass
 
     # ----- callbacks -----
 

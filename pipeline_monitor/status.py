@@ -264,8 +264,12 @@ def recording_status() -> dict[str, Any]:
       • `mic active — starting recording session`           → start
       • `sysaudio: stream started, piping PCM to stdout`    → start (sub-event)
       • `new session: meeting-2026-05-03T21-37-42.md`       → start (gives filename)
+      • `INFO chunk 9.1s -> meeting-...md (226 chars)`      → live (chunk landed)
       • `mic inactive — session ended`                      → stop
     Walks the tail backwards and returns the most recent state event.
+    Chunk lines are treated as live-recording evidence so long meetings
+    don't flip the indicator to Idle once the START sentinel scrolls past
+    the tail buffer.
     """
     out: dict[str, Any] = {"ok": False, "recording": False}
     if not MEETING_CAPTURE_LOG.exists():
@@ -274,21 +278,28 @@ def recording_status() -> dict[str, Any]:
     try:
         st = MEETING_CAPTURE_LOG.stat()
         out["log_age_s"] = int(time.time() - st.st_mtime)
+        # 64 KB tail covers ~25 min of busy logging — enough margin for
+        # a long-running meeting before the most recent sentinel scrolls
+        # off the buffer. Cheap, all in OS page cache.
         with MEETING_CAPTURE_LOG.open("rb") as f:
-            f.seek(max(0, st.st_size - 16384))
+            f.seek(max(0, st.st_size - 65536))
             tail = f.read().decode("utf-8", errors="ignore")
         lines = tail.strip().splitlines()
 
         recording = False
         current_file = None
-        last_session_filename: Optional[str] = None
         for line in reversed(lines):
             low = line.lower()
             # STOP sentinels — definitive end-of-recording markers
             if "session ended" in low or "recording stopped" in low or "shutting down" in low:
                 recording = False
                 break
-            # START sentinels — any of these means we're mid-recording
+            # START sentinels — any of these means we're mid-recording.
+            # Match against the original case-preserved line so the
+            # filename keeps its `T` separator (`meeting-...T13-01-53.md`).
+            chunk_match = re.search(
+                r"\bINFO chunk \d+(?:\.\d+)?s -> (\S+\.md)", line
+            )
             if (
                 "mic active" in low
                 or "starting recording session" in low
@@ -296,15 +307,22 @@ def recording_status() -> dict[str, Any]:
                 or "session started" in low
                 or low.startswith("new session:")
                 or " new session:" in low
+                or chunk_match is not None
             ):
                 recording = True
-                # Capture the filename from the "new session:" line if seen
-                # earlier in the tail (we walk backwards, so we may have
-                # already passed it). Look forward from this point for it.
+                # Prefer the filename from the chunk line we just matched
+                # (it's the most recent log entry). Fall back to the LAST
+                # "new session:" in the tail, which marks the current
+                # session if no chunks have landed yet.
                 if not current_file:
-                    m = re.search(r"new session:\s*(\S+\.md)", tail, re.IGNORECASE)
-                    if m:
-                        current_file = m.group(1)
+                    if chunk_match is not None:
+                        current_file = chunk_match.group(1)
+                    else:
+                        sess_matches = re.findall(
+                            r"new session:\s*(\S+\.md)", tail, re.IGNORECASE
+                        )
+                        if sess_matches:
+                            current_file = sess_matches[-1]
                 break
         out["recording"] = recording
         out["current_file"] = current_file

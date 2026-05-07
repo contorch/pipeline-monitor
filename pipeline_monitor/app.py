@@ -29,6 +29,22 @@ from .smoketest import run_smoke_test
 REFRESH_INTERVAL_S = 5
 PULSE_INTERVAL_S = 0.5
 
+
+def _notify(app: str, title: str, body: str) -> None:
+    """Best-effort macOS notification via osascript. Works without a signed
+    .app bundle (unlike rumps.notification, which silently no-ops in that
+    case). Failures are swallowed — notifications are optional UX."""
+    def _esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'display notification "{_esc(body)}" '
+        f'with title "{_esc(app)}" subtitle "{_esc(title)}"'
+    )
+    try:
+        subprocess.run(["osascript", "-e", script], timeout=3, check=False)
+    except Exception:
+        pass
+
 # Icon assets live alongside the package, two levels up from app.py
 # (repo_root/assets/) so the build-menubar-icons script can regenerate
 # them without touching the package itself.
@@ -337,14 +353,25 @@ class PipelineMonitor(rumps.App):
         rumps.notification("pipeline-monitor", "Refreshed", f"chroma={self._snap.chroma.get('doc_count','?')} docs")
 
     def _on_smoke_test(self, _):
-        rumps.notification("pipeline-monitor", "Running smoke test", "End-to-end pipeline check…")
+        # rumps.notification silently no-ops when Python isn't running as a
+        # signed .app bundle (which is our case under launchd). Use a modal
+        # alert + osascript notification so the result is always visible,
+        # and mirror to stderr so it lands in the launchd log.
+        import sys
+        _notify("pipeline-monitor", "Running smoke test", "End-to-end pipeline check…")
+        print("[smoke] starting…", file=sys.stderr, flush=True)
         result = run_smoke_test()
+        print(f"[smoke] result: {result}", file=sys.stderr, flush=True)
         if result["ok"]:
-            rumps.notification("pipeline-monitor", "✓ Smoke test passed",
-                               f"{result['duration_ms']}ms · {result['summary']}")
+            title = "Smoke test passed"
+            body = f"{result['duration_ms']}ms · {result['summary']}"
         else:
-            rumps.notification("pipeline-monitor", "✗ Smoke test failed",
-                               result.get("error", "unknown error"))
+            title = "Smoke test FAILED"
+            body = f"stage={result.get('stage','?')} · {result.get('error','unknown')[:200]}"
+        _notify("pipeline-monitor", title, body)
+        # Modal so the user always sees the result even if Notification Center
+        # is muted / Focus is on / app lacks notification permission.
+        rumps.alert(title=title, message=body, ok="OK")
         self._refresh_callback(None)
 
     def _on_open_transcripts(self, _):

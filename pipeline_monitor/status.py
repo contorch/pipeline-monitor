@@ -286,6 +286,25 @@ def recording_status() -> dict[str, Any]:
             tail = f.read().decode("utf-8", errors="ignore")
         lines = tail.strip().splitlines()
 
+        # Freshness guard: if the most-recent START sentinel is older than
+        # this, treat the daemon as not recording — covers the case where
+        # meeting-capture hangs (e.g. blocked SSL_read on a Gemini call) and
+        # never emits its STOP sentinel, leaving stale chunk lines as the
+        # newest evidence in the tail.
+        STALE_AFTER_S = 90
+        now = time.time()
+        ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+        def _age_seconds(line: str) -> float | None:
+            m = ts_re.match(line)
+            if not m:
+                return None
+            try:
+                ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+            except ValueError:
+                return None
+            return now - ts
+
         recording = False
         current_file = None
         for line in reversed(lines):
@@ -309,6 +328,12 @@ def recording_status() -> dict[str, Any]:
                 or " new session:" in low
                 or chunk_match is not None
             ):
+                age = _age_seconds(line)
+                if age is not None and age > STALE_AFTER_S:
+                    # Newest start-evidence is too old — daemon is stuck or
+                    # session ended without a stop-sentinel. Don't claim REC.
+                    recording = False
+                    break
                 recording = True
                 # Prefer the filename from the chunk line we just matched
                 # (it's the most recent log entry). Fall back to the LAST

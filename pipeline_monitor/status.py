@@ -305,8 +305,17 @@ def recording_status() -> dict[str, Any]:
                 return None
             return now - ts
 
+        # If we're in a session but no chunk has landed in this many seconds,
+        # flag the recording as STALE — daemon thinks it's recording but
+        # nothing is being captured. Most often: another app stole system
+        # audio capture (Cluely, Loom, OBS — anything using SCK / recall.ai).
+        # 120s is forgiving — a real meeting can have quiet stretches but
+        # not 2 minutes of total silence.
+        STALE_CHUNK_AFTER_S = 120
+
         recording = False
         current_file = None
+        last_chunk_age_s: float | None = None
         for line in reversed(lines):
             low = line.lower()
             # STOP sentinels — definitive end-of-recording markers
@@ -348,9 +357,22 @@ def recording_status() -> dict[str, Any]:
                         )
                         if sess_matches:
                             current_file = sess_matches[-1]
+                # Find the AGE of the newest chunk specifically (not just any
+                # start sentinel), so we can flag a stale recording when the
+                # daemon is alive but no PCM is reaching the chunker (e.g.
+                # another SCK consumer stole system audio capture).
+                for inner in reversed(lines):
+                    if re.search(r"\bINFO chunk \d+(?:\.\d+)?s -> (\S+\.md)", inner):
+                        a = _age_seconds(inner)
+                        if a is not None:
+                            last_chunk_age_s = a
+                        break
                 break
         out["recording"] = recording
         out["current_file"] = current_file
+        if recording and last_chunk_age_s is not None:
+            out["last_chunk_age_s"] = int(last_chunk_age_s)
+            out["stale"] = last_chunk_age_s > STALE_CHUNK_AFTER_S
         out["ok"] = True
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
@@ -427,6 +449,11 @@ class Snapshot:
         seen a tool call recently — Claude Code might just not be open.
         """
         if self.recording.get("recording"):
+            # Distinguish a healthy live recording from one where the daemon
+            # claims REC but no chunks are landing — the latter is a loud
+            # ⚠ in the menu bar so the user notices mid-meeting.
+            if self.recording.get("stale"):
+                return "rec_stale"
             return "rec"
         problems = []
         if not self.chroma.get("ok"):

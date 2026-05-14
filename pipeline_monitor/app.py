@@ -112,6 +112,13 @@ def _build_status_line(snap: st.Snapshot) -> rumps.MenuItem:
         return rumps.MenuItem(f"⚠ {_truncate(rec.get('error', 'unknown'), 50)}")
     if rec.get("recording"):
         f = rec.get("current_file")
+        if rec.get("stale"):
+            age_s = rec.get("last_chunk_age_s", 0)
+            mins = max(1, age_s // 60)
+            note = f"silent for {mins}m — another app likely capturing audio (Cluely / Loom / OBS)"
+            if f:
+                return rumps.MenuItem(f"⚠ Recording — {Path(f).name} · {note}")
+            return rumps.MenuItem(f"⚠ Recording — {note}")
         if f:
             return rumps.MenuItem(f"● Recording — {Path(f).name}")
         return rumps.MenuItem("● Recording")
@@ -440,6 +447,12 @@ class PipelineMonitor(rumps.App):
             # users can confirm at a glance even if the pulse is subtle.
             self._start_pulse()
             self.title = " REC" if self._has_icons else ICON_FALLBACK_RECORDING
+        elif overall == "rec_stale":
+            # Daemon claims REC but no chunks landing — show ⚠ REC, no pulse,
+            # so the user notices something's wrong mid-meeting before they
+            # lose 50 minutes of audio (the Cluely/SCK-conflict failure mode).
+            self._stop_pulse()
+            self.title = " ⚠ REC" if self._has_icons else "⚠ REC"
         elif overall == "err":
             self._stop_pulse()
             self.title = " ⚠" if self._has_icons else ICON_FALLBACK_ERR

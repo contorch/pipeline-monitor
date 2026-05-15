@@ -291,7 +291,16 @@ def recording_status() -> dict[str, Any]:
         # meeting-capture hangs (e.g. blocked SSL_read on a Gemini call) and
         # never emits its STOP sentinel, leaving stale chunk lines as the
         # newest evidence in the tail.
-        STALE_AFTER_S = 90
+        #
+        # 11 min: chunks legitimately gap up to MAX_CHUNK_SECONDS (600s) in
+        # meeting-capture's chunker — long monologues with intermittent
+        # silence accumulate into a single chunk that only emits at the max
+        # boundary. Earlier 90s was too aggressive and caused false-idle
+        # readings during normal long-form chunks. The daemon's own bails
+        # (recorder.py NO_EMIT_BAIL_S = 300s, SILENT_AUDIO_BAIL_S = 300s)
+        # mean any real wedge resolves itself within ~5 min anyway, so a
+        # generous monitor threshold doesn't lose us much actual visibility.
+        STALE_AFTER_S = 660
         now = time.time()
         ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
@@ -309,9 +318,15 @@ def recording_status() -> dict[str, Any]:
         # flag the recording as STALE — daemon thinks it's recording but
         # nothing is being captured. Most often: another app stole system
         # audio capture (Cluely, Loom, OBS — anything using SCK / recall.ai).
-        # 120s is forgiving — a real meeting can have quiet stretches but
-        # not 2 minutes of total silence.
-        STALE_CHUNK_AFTER_S = 120
+        #
+        # 600s = MAX_CHUNK_SECONDS in meeting-capture's chunker. A single
+        # legitimate chunk can accumulate up to that long during a quiet
+        # monologue before the chunker force-emits at the max boundary.
+        # Below this we'd false-warn during normal long chunks. Above it,
+        # the daemon's own no-emit / silent-pcm bails (both 300s) will have
+        # already fired and respawned sysaudio — so a real wedge produces a
+        # diagnostic in the daemon log within 5 min, well before this gate.
+        STALE_CHUNK_AFTER_S = 600
 
         recording = False
         current_file = None

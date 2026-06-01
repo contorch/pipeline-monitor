@@ -30,6 +30,35 @@ REFRESH_INTERVAL_S = 5
 PULSE_INTERVAL_S = 0.5
 
 
+def _prune_menu_refs(menu) -> None:
+    """Drop discarded NSMenuItems from rumps' global callback registry.
+
+    rumps registers every MenuItem in NSApp._ns_to_py_and_callback (a PLAIN
+    dict, not a WeakKeyDictionary), and Menu.clear() never prunes it. A daemon
+    that rebuilds its menu on a timer therefore pins every item it ever created
+    — observed leaking 6+ GB over ~13 days. Call this just before menu.clear()
+    so the about-to-be-discarded items can actually be deallocated. Defensive:
+    silently no-ops if rumps' internals move.
+    """
+    try:
+        registry = rumps.rumps.NSApp._ns_to_py_and_callback
+    except AttributeError:
+        return
+
+    def _walk(m):
+        try:
+            items = list(m.values())
+        except Exception:
+            return
+        for item in items:
+            ns = getattr(item, "_menuitem", None)
+            if ns is not None:
+                registry.pop(ns, None)
+            _walk(item)  # recurse into submenu children
+
+    _walk(menu)
+
+
 def _notify(app: str, title: str, body: str) -> None:
     """Best-effort macOS notification via osascript. Works without a signed
     .app bundle (unlike rumps.notification, which silently no-ops in that
@@ -465,6 +494,7 @@ class PipelineMonitor(rumps.App):
         # hook lines, separator, daemon summary + 3 submenus, separator,
         # actions. Headers are intentionally absent — separators do the
         # grouping work without consuming a row each.
+        _prune_menu_refs(self.menu)  # release prior items from rumps' global registry
         self.menu.clear()
 
         self.menu.add(_build_status_line(snap))

@@ -424,8 +424,12 @@ class PipelineMonitor(rumps.App):
             rumps.notification("pipeline-monitor", "No MCP log", "Server may not have run yet")
 
     def _on_restart_chroma(self, _):
-        plist = Path.home() / "Library/LaunchAgents/com.stirredo.context-orchestrator-chroma.plist"
-        if not plist.exists():
+        # com.stirredo.* → com.contorch.* rebrand: use whichever plist exists.
+        for org in ("contorch", "stirredo"):
+            plist = Path.home() / f"Library/LaunchAgents/com.{org}.context-orchestrator-chroma.plist"
+            if plist.exists():
+                break
+        else:
             rumps.notification("pipeline-monitor", "Plist missing", str(plist))
             return
         try:

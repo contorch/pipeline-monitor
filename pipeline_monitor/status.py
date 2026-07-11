@@ -182,10 +182,17 @@ def mcp_status(tail_calls: int = 20) -> dict[str, Any]:
 
 # ----------------------------------------------------------- launchd
 
+# Daemons are being rebranded com.stirredo.* → com.contorch.* — watch both
+# prefixes during the transition and report whichever variant is loaded.
+_DAEMON_SUFFIXES = [
+    "context-orchestrator-chroma",
+    "transcript-watcher",
+    "meeting-capture",
+]
 LAUNCHD_TARGETS = [
-    "com.stirredo.context-orchestrator-chroma",
-    "com.stirredo.transcript-watcher",
-    "com.stirredo.meeting-capture",
+    f"com.{org}.{suffix}"
+    for suffix in _DAEMON_SUFFIXES
+    for org in ("contorch", "stirredo")
 ]
 
 
@@ -200,6 +207,7 @@ def launchd_status() -> dict[str, Any]:
             out["error"] = r.stderr.strip()
             return out
         lines = r.stdout.strip().splitlines()
+        found: dict[str, Any] = {}
         # Format: PID  Status  Label
         for line in lines[1:]:  # skip header
             parts = line.split(None, 2)
@@ -207,16 +215,24 @@ def launchd_status() -> dict[str, Any]:
                 continue
             pid_s, status_s, label = parts
             if label in LAUNCHD_TARGETS:
-                out["daemons"][label] = {
+                found[label] = {
                     "pid": None if pid_s == "-" else int(pid_s),
                     "status": int(status_s),  # last exit code
                     "running": pid_s != "-",
+                    "installed": True,
                 }
-        # Mark unknown daemons as not-installed
-        for t in LAUNCHD_TARGETS:
-            out["daemons"].setdefault(t, {"pid": None, "status": None, "running": False, "installed": False})
-            if "installed" not in out["daemons"][t]:
-                out["daemons"][t]["installed"] = True
+        # One entry per daemon: prefer the loaded variant (contorch first)
+        # so a machine mid-rebrand doesn't show duplicate/ghost rows.
+        for suffix in _DAEMON_SUFFIXES:
+            for org in ("contorch", "stirredo"):
+                label = f"com.{org}.{suffix}"
+                if label in found:
+                    out["daemons"][label] = found[label]
+                    break
+            else:
+                out["daemons"][f"com.contorch.{suffix}"] = {
+                    "pid": None, "status": None, "running": False, "installed": False,
+                }
         out["ok"] = True
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"

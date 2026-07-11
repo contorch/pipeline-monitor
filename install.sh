@@ -13,7 +13,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$REPO_ROOT/.venv"
 PYTHON="${PYTHON:-python3}"
-PLIST_LABEL="com.stirredo.pipeline-monitor"
+PLIST_LABEL="com.contorch.pipeline-monitor"
 PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/pipeline-monitor"
 

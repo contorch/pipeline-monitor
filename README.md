@@ -26,7 +26,7 @@ End-to-end smoke test: inserts a marker doc → searches for it → deletes it. 
 ## Install
 
 ```bash
-git clone https://github.com/stirredo/pipeline-monitor.git ~/tasks/pipeline-monitor
+git clone https://github.com/contorch/pipeline-monitor.git ~/tasks/pipeline-monitor
 cd ~/tasks/pipeline-monitor
 ./install.sh                # create venv, install deps, launch once
 ./install.sh --autostart    # add launchd agent so it starts at login
@@ -72,5 +72,5 @@ Three independent daemons (chroma, transcript-watcher, meeting-capture) plus an 
 
 ## See also
 
-- [`stirredo/context-orchestrator`](https://github.com/stirredo/context-orchestrator) — task + context store, MCP server, auto-context hook
+- [`stirredo/context-orchestrator`](https://github.com/contorch/context-orchestrator) — task + context store, MCP server, auto-context hook
 - meeting-capture — audio capture daemon (sysaudio / ScreenCaptureKit)

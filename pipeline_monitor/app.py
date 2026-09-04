@@ -87,6 +87,12 @@ GLYPH_REC = ASSETS_DIR / "glyph-rec.png"
 ICON_FALLBACK_RECORDING = "● REC"
 ICON_FALLBACK_OK = "○"
 ICON_FALLBACK_ERR = "⚠"
+ICON_FALLBACK_PERM = "⚠ PERM"
+
+PERM_HINT = (
+    "sysaudio denied Screen Recording — re-add bin/sysaudio in "
+    "System Settings → Privacy & Security → Screen & System Audio Recording"
+)
 
 
 def _ago(iso_or_seconds) -> str:
@@ -134,11 +140,22 @@ def _truncate(s: str, n: int = 60) -> str:
 #   - Status glyphs only when something's wrong (●/✓/✗/⚠), not as bullets
 #   - All previous functionality still reachable, just one click deeper
 
+def _open_screen_recording_settings(_=None):
+    """Jump straight to the Screen & System Audio Recording privacy pane."""
+    subprocess.Popen([
+        "open",
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+    ])
+
+
 def _build_status_line(snap: st.Snapshot) -> rumps.MenuItem:
     """Top of menu — recording state. Visible at a glance."""
     rec = snap.recording
     if not rec.get("ok"):
         return rumps.MenuItem(f"⚠ {_truncate(rec.get('error', 'unknown'), 50)}")
+    if rec.get("permission_denied"):
+        item = rumps.MenuItem(f"⚠ {PERM_HINT}", callback=_open_screen_recording_settings)
+        return item
     if rec.get("recording"):
         f = rec.get("current_file")
         if rec.get("stale"):
@@ -486,6 +503,11 @@ class PipelineMonitor(rumps.App):
             # lose 50 minutes of audio (the Cluely/SCK-conflict failure mode).
             self._stop_pulse()
             self.title = " ⚠ REC" if self._has_icons else "⚠ REC"
+        elif overall == "perm":
+            # sysaudio refused Screen Recording — nothing is being captured
+            # even though the daemon is up. Name the problem in the bar.
+            self._stop_pulse()
+            self.title = " ⚠ PERM" if self._has_icons else ICON_FALLBACK_PERM
         elif overall == "err":
             self._stop_pulse()
             self.title = " ⚠" if self._has_icons else ICON_FALLBACK_ERR

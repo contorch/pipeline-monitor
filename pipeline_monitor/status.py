@@ -280,9 +280,14 @@ def recording_status() -> dict[str, Any]:
       • `mic active — starting recording session`           → start
       • `sysaudio: stream started, piping PCM to stdout`    → start (sub-event)
       • `new session: meeting-2026-05-03T21-37-42.md`       → start (gives filename)
-      • `INFO chunk 9.1s -> meeting-...md (226 chars)`      → live (chunk landed)
+      • `INFO chunk 9.1s [them] -> meeting-...md (226 chars)` → live (chunk landed; role tag [them]/[me] since v0.2.0)
       • `mic inactive — session ended`                      → stop
+      • `sysaudio error: ... "The user declined TCCs ..."`  → permission denied
     Walks the tail backwards and returns the most recent state event.
+    A `declined TCCs` line newer than the last `stream started` line means
+    sysaudio's Screen Recording grant is gone (macOS update / rebuild) —
+    surfaced as `permission_denied` so the menu bar shows ⚠ PERM instead
+    of a misleading ○ Idle while every session dies at spawn.
     Chunk lines are treated as live-recording evidence so long meetings
     don't flip the indicator to Idle once the START sentinel scrolls past
     the tail buffer.
@@ -344,6 +349,30 @@ def recording_status() -> dict[str, Any]:
         # diagnostic in the daemon log within 5 min, well before this gate.
         STALE_CHUNK_AFTER_S = 600
 
+        # Permission check first: the decline line is followed by a
+        # "session ended" STOP sentinel, so the state walk below would
+        # otherwise just report Idle. sysaudio's own lines carry no
+        # timestamp, so age comes from the nearest earlier daemon line.
+        PERM_DENIED_WINDOW_S = 15 * 60  # daemon backoff caps at 300s
+        denied_idx = started_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            low = lines[i].lower()
+            if denied_idx is None and "declined tccs" in low:
+                denied_idx = i
+            elif started_idx is None and "sysaudio: stream started" in low:
+                started_idx = i
+            if denied_idx is not None and started_idx is not None:
+                break
+        if denied_idx is not None and (started_idx is None or denied_idx > started_idx):
+            denied_age = None
+            for j in range(denied_idx, -1, -1):
+                denied_age = _age_seconds(lines[j])
+                if denied_age is not None:
+                    break
+            if denied_age is not None and denied_age <= PERM_DENIED_WINDOW_S:
+                out["permission_denied"] = True
+                out["permission_denied_age_s"] = int(denied_age)
+
         recording = False
         current_file = None
         last_chunk_age_s: float | None = None
@@ -357,7 +386,7 @@ def recording_status() -> dict[str, Any]:
             # Match against the original case-preserved line so the
             # filename keeps its `T` separator (`meeting-...T13-01-53.md`).
             chunk_match = re.search(
-                r"\bINFO chunk \d+(?:\.\d+)?s -> (\S+\.md)", line
+                r"\bINFO chunk \d+(?:\.\d+)?s (?:\[\w+\] )?-> (\S+\.md)", line
             )
             if (
                 "mic active" in low
@@ -393,12 +422,15 @@ def recording_status() -> dict[str, Any]:
                 # daemon is alive but no PCM is reaching the chunker (e.g.
                 # another SCK consumer stole system audio capture).
                 for inner in reversed(lines):
-                    if re.search(r"\bINFO chunk \d+(?:\.\d+)?s -> (\S+\.md)", inner):
+                    if re.search(r"\bINFO chunk \d+(?:\.\d+)?s (?:\[\w+\] )?-> (\S+\.md)", inner):
                         a = _age_seconds(inner)
                         if a is not None:
                             last_chunk_age_s = a
                         break
                 break
+        if out.get("permission_denied"):
+            # Whatever the walk concluded, a denied spawn is not a recording.
+            recording = False
         out["recording"] = recording
         out["current_file"] = current_file
         if recording and last_chunk_age_s is not None:
@@ -470,7 +502,7 @@ class Snapshot:
     disk: dict[str, Any] = field(default_factory=dict)
 
     def overall(self) -> str:
-        """State for the menu bar icon: rec / err / ok.
+        """State for the menu bar icon: rec / rec_stale / perm / err / ok.
 
         Only flag 'err' for things that actually mean something is broken:
           - chroma daemon unreachable
@@ -486,6 +518,11 @@ class Snapshot:
             if self.recording.get("stale"):
                 return "rec_stale"
             return "rec"
+        if self.recording.get("permission_denied"):
+            # sysaudio is being refused Screen Recording — every session dies
+            # at spawn, so the meeting is NOT being captured. Loudest state
+            # short of a live recording.
+            return "perm"
         problems = []
         if not self.chroma.get("ok"):
             problems.append("chroma")

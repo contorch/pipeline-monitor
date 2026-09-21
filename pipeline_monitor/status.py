@@ -195,6 +195,33 @@ LAUNCHD_TARGETS = [
     for org in ("contorch", "stirredo")
 ]
 
+MEETING_CAPTURE_PLIST = HOME / "Library" / "LaunchAgents" / "com.contorch.meeting-capture.plist"
+CAPTURE_MODES = ("batch", "live")
+
+
+def capture_mode_status() -> dict[str, Any]:
+    """Which capture mode the meeting-capture launchd agent is configured for.
+
+    Read straight from the agent's plist rather than shelling out to
+    `meeting-capture mode`: it is the same key the CLI edits
+    (MEETING_CAPTURE_MODE), costs a file read, and stays correct even when
+    the daemon is between relaunches. "batch" when the key is absent.
+    """
+    out: dict[str, Any] = {"ok": False, "mode": "batch", "installed": MEETING_CAPTURE_PLIST.exists()}
+    if not out["installed"]:
+        out["error"] = "meeting-capture launchd agent not installed"
+        return out
+    try:
+        import plistlib
+        env = plistlib.loads(MEETING_CAPTURE_PLIST.read_bytes()).get("EnvironmentVariables") or {}
+        mode = str(env.get("MEETING_CAPTURE_MODE", "batch")).strip().lower()
+        out["mode"] = mode if mode in CAPTURE_MODES else "batch"
+        out["ok"] = True
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
 
 def launchd_status() -> dict[str, Any]:
     """`launchctl list` parsed for our daemons."""
@@ -498,6 +525,7 @@ class Snapshot:
     launchd: dict[str, Any] = field(default_factory=dict)
     recordings: dict[str, Any] = field(default_factory=dict)
     recording: dict[str, Any] = field(default_factory=dict)
+    capture_mode: dict[str, Any] = field(default_factory=dict)
     hook: dict[str, Any] = field(default_factory=dict)
     disk: dict[str, Any] = field(default_factory=dict)
 
@@ -554,6 +582,7 @@ def collect() -> Snapshot:
         launchd=launchd_status(),
         recordings=recordings_status(),
         recording=recording_status(),
+        capture_mode=capture_mode_status(),
         hook=hook_status(),
         disk=disk_status(),
     )

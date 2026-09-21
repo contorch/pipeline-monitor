@@ -12,7 +12,9 @@ submenu at the bottom. Auto-refreshes every REFRESH_INTERVAL_S seconds.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import threading
 import time
 import webbrowser
 from datetime import datetime
@@ -148,9 +150,16 @@ def _open_screen_recording_settings(_=None):
     ])
 
 
+def _mode_suffix(snap: st.Snapshot) -> str:
+    """' · live' / ' · batch' for the status line; empty if the agent is missing."""
+    cm = snap.capture_mode or {}
+    return f" · {cm['mode']}" if cm.get("ok") else ""
+
+
 def _build_status_line(snap: st.Snapshot) -> rumps.MenuItem:
-    """Top of menu — recording state. Visible at a glance."""
+    """Top of menu — recording state and capture mode. Visible at a glance."""
     rec = snap.recording
+    mode = _mode_suffix(snap)
     if not rec.get("ok"):
         return rumps.MenuItem(f"⚠ {_truncate(rec.get('error', 'unknown'), 50)}")
     if rec.get("permission_denied"):
@@ -166,9 +175,22 @@ def _build_status_line(snap: st.Snapshot) -> rumps.MenuItem:
                 return rumps.MenuItem(f"⚠ Recording — {Path(f).name} · {note}")
             return rumps.MenuItem(f"⚠ Recording — {note}")
         if f:
-            return rumps.MenuItem(f"● Recording — {Path(f).name}")
-        return rumps.MenuItem("● Recording")
-    return rumps.MenuItem("○ Idle")
+            return rumps.MenuItem(f"● Recording{mode} — {Path(f).name}")
+        return rumps.MenuItem(f"● Recording{mode}")
+    return rumps.MenuItem(f"○ Idle{mode}")
+
+
+def _meeting_capture_bin() -> str | None:
+    """The meeting-capture CLI. launchd does not give this app a shell PATH,
+    so fall back to the brew wrapper and then the daemon's own venv."""
+    for candidate in (
+        shutil.which("meeting-capture"),
+        "/opt/homebrew/bin/meeting-capture",
+        str(Path.home() / ".meeting-capture" / "venv" / "bin" / "meeting-capture"),
+    ):
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return None
 
 
 def _build_index_line(snap: st.Snapshot) -> rumps.MenuItem:
@@ -355,6 +377,7 @@ class _MenuOpenDelegate(NSObject):
 
 class PipelineMonitor(rumps.App):
     def __init__(self):
+        self._mode_switching: str | None = None  # target mode while a switch is in flight
         # Use the template glyph if available; otherwise fall back to text.
         # template=True tells macOS to auto-tint for light/dark menu bars.
         if GLYPH_TEMPLATE.exists():
@@ -549,8 +572,58 @@ class PipelineMonitor(rumps.App):
         open_submenu.add(rumps.MenuItem("MCP log", callback=self._on_open_mcp_log))
         self.menu.add(open_submenu)
         self.menu.add(rumps.MenuItem("Restart chroma", callback=self._on_restart_chroma))
+        self.menu.add(self._build_mode_toggle(snap))
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Quit", callback=self._on_quit))
+
+    # ----- capture mode toggle -----
+    #
+    # One item that flips between "Switch to live mode" and "Switch to batch
+    # mode". It is a thin wrapper over `meeting-capture mode <target>`, which
+    # owns the real work (edit MEETING_CAPTURE_MODE in the launchd plist and
+    # relaunch the agent) so the CLI and the menu can never disagree. The
+    # relaunch cuts any session in progress, so the item is inert while a
+    # recording is live — switch before the call, not during it.
+
+    def _build_mode_toggle(self, snap: st.Snapshot) -> rumps.MenuItem:
+        cm = snap.capture_mode or {}
+        if not cm.get("ok"):
+            return rumps.MenuItem("Capture mode: agent not installed")
+        target = "batch" if cm["mode"] == "live" else "live"
+        if self._mode_switching:
+            return rumps.MenuItem(f"Switching to {self._mode_switching} mode…")
+        if snap.recording.get("recording"):
+            return rumps.MenuItem(f"Switch to {target} mode (stop recording first)")
+        item = rumps.MenuItem(f"Switch to {target} mode")
+        item.set_callback(lambda _, t=target: self._on_switch_mode(t))
+        return item
+
+    def _on_switch_mode(self, target: str):
+        binary = _meeting_capture_bin()
+        if binary is None:
+            _notify("pipeline-monitor", "meeting-capture not found", "Install the CLI (brew or pip) first.")
+            return
+        self._mode_switching = target
+        self._refresh_callback(None)
+
+        def _run():
+            try:
+                res = subprocess.run([binary, "mode", target], capture_output=True, text=True, timeout=45)
+                if res.returncode == 0:
+                    _notify("pipeline-monitor", f"Capture mode: {target}",
+                            "Daemon relaunched. Next meeting streams live." if target == "live"
+                            else "Daemon relaunched. Back to chunked transcription.")
+                else:
+                    _notify("pipeline-monitor", "Mode switch failed",
+                            (res.stderr or res.stdout or "unknown error").strip()[-200:])
+            except Exception as e:  # noqa: BLE001 — surface anything to the user
+                _notify("pipeline-monitor", "Mode switch failed", str(e))
+            finally:
+                self._mode_switching = None
+                # Back on the main thread for the AppKit menu rebuild.
+                AppHelper.callAfter(self._refresh_callback, None)
+
+        threading.Thread(target=_run, name="capture-mode-switch", daemon=True).start()
 
 
 def main():

@@ -61,15 +61,24 @@ fi
 "$VENV/bin/pip" install --quiet -e "$REPO_ROOT" >/dev/null
 ok "installed deps + pipeline-monitor (editable)"
 
-# Verify it can boot for 2s without crashing
-if timeout 2 "$VENV/bin/pipeline-monitor" >/dev/null 2>&1; status=$?; [ $status -eq 124 ] || true; then
-    ok "boot smoke test passed"
-else
-    warn "app exited non-zero on smoke boot — may need an interactive run to see error"
-fi
+# Verify it can boot without crashing: run it for 3s and require that it is
+# still alive at the deadline. (The old `timeout 2 … || true` passed every exit
+# code — and stock macOS has no `timeout` — so a crash on launch printed
+# "passed" and the user got no icon and no clue.)
+"$VENV/bin/python" - "$VENV/bin/pipeline-monitor" <<'PYEOF' || fail "pipeline-monitor crashed on launch (see output above) — fix that before installing the login item"
+import subprocess, sys
+p = subprocess.Popen([sys.argv[1]], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+try:
+    out, _ = p.communicate(timeout=3)
+except subprocess.TimeoutExpired:
+    p.kill(); p.wait()
+    sys.exit(0)          # still running at the deadline: booted fine
+print(out[-2000:]); sys.exit(1)
+PYEOF
+ok "boot smoke test passed (alive after 3s)"
 
 if [ "$AUTOSTART" = 1 ]; then
-    mkdir -p "$LOG_DIR"
+    mkdir -p "$LOG_DIR" "$(dirname "$PLIST_PATH")"
     cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -93,8 +102,14 @@ if [ "$AUTOSTART" = 1 ]; then
 </plist>
 EOF
     launchctl unload "$PLIST_PATH" 2>/dev/null || true
-    launchctl load "$PLIST_PATH"
-    ok "installed launchd agent — pipeline-monitor will auto-start at login"
+    launchctl load "$PLIST_PATH" || fail "launchctl load failed for $PLIST_PATH"
+    # launchd reports load success even if the app then dies; check it stayed up.
+    sleep 3
+    if launchctl list "$PLIST_LABEL" 2>/dev/null | grep -q '"PID"'; then
+        ok "installed launchd agent — pipeline-monitor is running and will auto-start at login"
+    else
+        fail "launchd agent installed but the app is not running — check $LOG_DIR/stderr.log"
+    fi
 fi
 
 # Launch once now (unless autostart launchd just did it)

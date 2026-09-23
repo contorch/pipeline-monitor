@@ -243,6 +243,23 @@ def _existing_mcp_env() -> dict:
     return {k: v for k, v in (srv.get("env") or {}).items() if k.startswith("CO_")}
 
 
+def _existing_mcp_entry() -> dict | None:
+    try:
+        return json.loads(CLAUDE_JSON.read_text()).get("mcpServers", {}).get(MCP_NAME)
+    except Exception:
+        return None
+
+
+def mcp_add_cmd(claude: str, env: dict, server: str) -> list[str]:
+    """`claude mcp add` argv. The server name must come BEFORE the -e options:
+    -e is variadic in the Claude CLI and swallows everything up to `--`,
+    including a name placed after it ("missing required argument")."""
+    cmd = [claude, "mcp", "add", "--scope", "user", MCP_NAME]
+    for k, v in env.items():
+        cmd += ["-e", f"{k}={v}"]
+    return cmd + ["--", server]
+
+
 def _claude_md_template() -> Path | None:
     brew = shutil.which("brew")
     if brew:
@@ -338,18 +355,19 @@ def setup(log=print) -> bool:
     step("Claude Code connection")
     if claude:
         env = _existing_mcp_env()
+        previous = _existing_mcp_entry()
         _run([claude, "mcp", "remove", "--scope", "user", MCP_NAME])
-        cmd = [claude, "mcp", "add", "--scope", "user"]
-        for k, v in env.items():
-            cmd += ["-e", f"{k}={v}"]
-        cmd += [MCP_NAME, "--", bins["contorch-mcp"]]
-        res = _run(cmd)
+        res = _run(mcp_add_cmd(claude, env, bins["contorch-mcp"]))
         if res.returncode == 0:
             log(f"  ✓ registered `{MCP_NAME}` → {bins['contorch-mcp']}"
                 + (f" (kept {', '.join(env)})" if env else ""))
             done.append("Claude Code registration")
         else:
             log("  ✗ claude mcp add failed: " + (res.stderr or res.stdout).strip()[-300:])
+            if previous:
+                # Never leave Claude with no server: put the old entry back.
+                _run([claude, "mcp", "add-json", "--scope", "user", MCP_NAME, json.dumps(previous)])
+                log("    restored your previous registration")
             todo.append("Register the MCP server: claude mcp add --scope user "
                         f"{MCP_NAME} -- {bins['contorch-mcp']}")
         tpl = _claude_md_template()

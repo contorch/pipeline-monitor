@@ -92,3 +92,10 @@ def test_legacy_label_is_picked_up(tmp_path, monkeypatch):
 def test_nothing_installed(tmp_path, monkeypatch):
     monkeypatch.setattr(ct, "LAUNCH_AGENTS", tmp_path)
     assert ct.stop(log=lambda *_: None) is False
+
+
+def test_mcp_add_puts_name_before_variadic_env():
+    cmd = ct.mcp_add_cmd("claude", {"CO_A": "1", "CO_B": "2"}, "/bin/contorch-mcp")
+    assert cmd[:6] == ["claude", "mcp", "add", "--scope", "user", ct.MCP_NAME]
+    assert cmd[-2:] == ["--", "/bin/contorch-mcp"]
+    assert cmd.index(ct.MCP_NAME) < cmd.index("-e")

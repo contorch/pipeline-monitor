@@ -1,6 +1,6 @@
 [project]
 name = "pipeline-monitor"
-version = "0.2.1"
+version = "0.2.2"
 description = "macOS menu bar app for observing the meeting-capture + context-orchestrator pipeline"
 requires-python = ">=3.10"
 dependencies = [

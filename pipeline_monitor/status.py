@@ -184,9 +184,10 @@ def mcp_status(tail_calls: int = 20) -> dict[str, Any]:
 
 # Daemons are being rebranded com.stirredo.* → com.contorch.* — watch both
 # prefixes during the transition and report whichever variant is loaded.
+# transcript-watcher is gone from the default install (context-orchestrator
+# 0.3 indexes on demand from the MCP server), so it is not a required daemon.
 _DAEMON_SUFFIXES = [
     "context-orchestrator-chroma",
-    "transcript-watcher",
     "meeting-capture",
 ]
 LAUNCHD_TARGETS = [

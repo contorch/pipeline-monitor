@@ -324,10 +324,15 @@ def setup(log=print) -> bool:
     else:
         log("  ✗ chroma did not answer within 90s — see ~/.context-orchestrator/chroma-daemon.log")
         return False
-    res = _run([bins["transcript-watcher"], "install"])
-    _launchctl("enable", f"gui/{_uid()}/com.contorch.transcript-watcher")
-    log("  ✓ transcript indexer running" if res.returncode == 0 else "  ✗ transcript-watcher install failed")
-    done.append("search index + indexer")
+    # No indexer daemon: the MCP server indexes new transcripts on demand
+    # (context-orchestrator 0.3+). Retire an agent from an older install.
+    for org in ORGS:
+        plist = LAUNCH_AGENTS / f"com.{org}.transcript-watcher.plist"
+        if plist.is_file():
+            _launchctl("bootout", f"gui/{_uid()}/com.{org}.transcript-watcher")
+            plist.unlink()
+            log("  ✓ removed the old transcript-watcher daemon (indexing is on demand now)")
+    done.append("search index")
 
     # 4. Claude Code
     step("Claude Code connection")
@@ -348,7 +353,10 @@ def setup(log=print) -> bool:
             todo.append("Register the MCP server: claude mcp add --scope user "
                         f"{MCP_NAME} -- {bins['contorch-mcp']}")
         tpl = _claude_md_template()
-        if tpl and not (CLAUDE_MD.is_file() and "CONTEXT-ORCHESTRATOR" in CLAUDE_MD.read_text()):
+        # Skip if CLAUDE.md already covers it — the template's marker, or the
+        # user's own hand-written guidance (don't give them two copies).
+        existing = CLAUDE_MD.read_text().lower() if CLAUDE_MD.is_file() else ""
+        if tpl and "context-orchestrator" not in existing and "context orchestrator" not in existing:
             CLAUDE_MD.parent.mkdir(parents=True, exist_ok=True)
             with CLAUDE_MD.open("a") as f:
                 f.write("\n" + tpl.read_text())

@@ -25,6 +25,7 @@ import rumps
 from AppKit import NSObject
 from PyObjCTools import AppHelper  # noqa: F401  (ensures AppKit init order)
 
+from . import contorch as ct
 from . import status as st
 from .smoketest import run_smoke_test
 
@@ -158,6 +159,8 @@ def _mode_suffix(snap: st.Snapshot) -> str:
 
 def _build_status_line(snap: st.Snapshot) -> rumps.MenuItem:
     """Top of menu — recording state and capture mode. Visible at a glance."""
+    if ct.is_stopped():
+        return rumps.MenuItem("⏸ contorch is stopped — nothing is recording")
     rec = snap.recording
     mode = _mode_suffix(snap)
     if not rec.get("ok"):
@@ -378,6 +381,7 @@ class _MenuOpenDelegate(NSObject):
 class PipelineMonitor(rumps.App):
     def __init__(self):
         self._mode_switching: str | None = None  # target mode while a switch is in flight
+        self._stack_busy: str | None = None      # 'Stopping'/'Resuming' while a stop/resume runs
         # Use the template glyph if available; otherwise fall back to text.
         # template=True tells macOS to auto-tint for light/dark menu bars.
         if GLYPH_TEMPLATE.exists():
@@ -573,6 +577,7 @@ class PipelineMonitor(rumps.App):
         self.menu.add(open_submenu)
         self.menu.add(rumps.MenuItem("Restart chroma", callback=self._on_restart_chroma))
         self.menu.add(self._build_mode_toggle(snap))
+        self.menu.add(self._build_stack_toggle())
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Quit", callback=self._on_quit))
 
@@ -624,6 +629,43 @@ class PipelineMonitor(rumps.App):
                 AppHelper.callAfter(self._refresh_callback, None)
 
         threading.Thread(target=_run, name="capture-mode-switch", daemon=True).start()
+
+
+    # ----- stop / resume everything -----
+    #
+    # Same code path as `contorch stop` / `contorch resume` (contorch.py), so
+    # the menu and the CLI cannot disagree. The menu-bar app itself keeps
+    # running — it is where you resume from.
+
+    def _build_stack_toggle(self) -> rumps.MenuItem:
+        if self._stack_busy:
+            return rumps.MenuItem(f"{self._stack_busy} contorch…")
+        if ct.is_stopped():
+            return rumps.MenuItem("Resume everything", callback=lambda _: self._on_stack("resume"))
+        return rumps.MenuItem("Stop everything", callback=lambda _: self._on_stack("stop"))
+
+    def _on_stack(self, action: str):
+        self._stack_busy = "Stopping" if action == "stop" else "Resuming"
+        self._refresh_callback(None)
+
+        def _run():
+            lines: list[str] = []
+            try:
+                ok = (ct.stop if action == "stop" else ct.resume)(log=lines.append)
+                if action == "stop":
+                    _notify("contorch", "Stopped" if ok else "Stopped with errors",
+                            "Nothing records or indexes until you choose Resume everything."
+                            if ok else "\n".join(lines)[-200:])
+                else:
+                    _notify("contorch", "Running" if ok else "Resumed with errors",
+                            "Capture, indexing and search are back." if ok else "\n".join(lines)[-200:])
+            except Exception as e:  # noqa: BLE001 — surface anything to the user
+                _notify("contorch", f"{action.capitalize()} failed", str(e))
+            finally:
+                self._stack_busy = None
+                AppHelper.callAfter(self._refresh_callback, None)
+
+        threading.Thread(target=_run, name=f"contorch-{action}", daemon=True).start()
 
 
 def main():

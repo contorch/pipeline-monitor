@@ -295,6 +295,7 @@ def setup(log=print) -> bool:
         else:
             todo.append(f"Add a Gemini key: write it to {KEY_FILE} (chmod 600), then run `contorch setup` again")
     else:
+        log(f"  ✗ no key found, and no terminal to ask on — meeting transcription stays off")
         todo.append(f"Add a Gemini key: write it to {KEY_FILE} (chmod 600), then run `contorch setup` again")
 
     # 2. Move an older source install over, with a backup of the index.

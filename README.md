@@ -14,12 +14,12 @@ Glanceable state in the menu bar — `○` idle / `● REC` recording / `⚠` so
 
 | Section | Data |
 |---|---|
-| **NOW** | Recording state + current session file (from meeting-capture daemon log) |
-| **RECENT SESSIONS** | Last 10 transcript files. Click to open. |
+| **NOW** | Recording state + current meeting (from the meeting-capture daemon log) |
+| **RECENT SESSIONS** | Last 10 transcripts (from the context-orchestrator database; legacy `~/transcripts/*.md` too). Click to open the text. |
 | **INDEX HEALTH** | Chroma doc count + embedding dim · SQLite tasks/sources/insights · last insight age |
 | **MCP / CONNECTIONS** | MCP server activity · last tool call (tool, result, latency, ago) · auto-context hook last fire (ago + latency + chars injected) · expandable timeline of last 20 calls |
 | **SYSTEM HEALTH** | launchd daemon status with PIDs · disk usage per data dir |
-| **Actions** | Refresh now · Run end-to-end smoke test · Open transcripts/CO dir/MCP log · Restart chroma daemon · Quit |
+| **Actions** | Refresh now · Run end-to-end smoke test · **Recording settings…** (`meeting-capture ui`: source, USB-interface inputs, live levels) · Open latest transcript/CO dir/MCP log · Restart chroma daemon · capture mode · Stop/Resume everything · Quit |
 
 End-to-end smoke test: inserts a marker doc → searches for it → deletes it. One-click "is the whole stack actually working right now?" check. Reports rank + latency in a notification.
 
@@ -49,7 +49,7 @@ If yours lives elsewhere, set `CO_REPO=/path/to/repo` in your shell rc.
 Other paths (hard-coded, all standard for the pipeline):
 
 - `~/.context-orchestrator/` — chroma data, SQLite, daemon logs, hook heartbeat
-- `~/transcripts/` — meeting-capture's session output
+- `~/.context-orchestrator/context.db` — transcripts (table `transcripts`, meeting-capture ≥ 0.5); `~/transcripts/` only on older installs
 - `~/.meeting-capture/daemon.log` — recording state source-of-truth
 - `~/Library/Caches/claude-cli-nodejs/.../mcp-logs-context-orchestrator/` — MCP tool-call timeline source
 

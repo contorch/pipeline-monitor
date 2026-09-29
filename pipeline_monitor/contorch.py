@@ -270,6 +270,50 @@ def _claude_md_template() -> Path | None:
     return None
 
 
+EMBEDDING_CHOICES = (
+    ("gemini", "Gemini — best at paraphrased questions; needs the key, sends text to Google"),
+    ("local", "Local model — offline, no key; ~80 MB download; weaker on paraphrases"),
+    ("none", "None — keyword search only; nothing leaves this Mac"),
+)
+
+
+def _contorch_memory_bin() -> str | None:
+    for c in (shutil.which("contorch-memory"),
+              str(Path.home() / ".context-orchestrator" / "venv" / "bin" / "contorch-memory")):
+        if c and Path(c).is_file():
+            return c
+    return None
+
+
+def _setup_embeddings(log, todo: list, done: list, choice: str | None = None) -> None:
+    """Ask gemini / local / none and store it with `contorch-memory embeddings`.
+    Full-text search is on whatever the answer. Non-interactive runs keep the
+    current setting (default: Gemini when a key exists, else local)."""
+    cm = _contorch_memory_bin()
+    if not cm:
+        log("  · this context-orchestrator predates the choice — using Gemini when a key exists")
+        return
+    current = _run([cm, "embeddings"]).stdout.strip()
+    if choice is None and _interactive():
+        log(f"  Now: {current}")
+        default = "gemini" if _have_key() else "local"
+        for i, (name, desc) in enumerate(EMBEDDING_CHOICES, 1):
+            log(f"    {i}. {desc}{'  (default)' if name == default else ''}")
+        ans = input("  Choose 1-3 (Enter for default): ").strip()
+        choice = {"1": "gemini", "2": "local", "3": "none"}.get(ans, default)
+    if choice is None:
+        log(f"  ✓ {current} (unchanged — `contorch-memory embeddings gemini|local|none` to change)")
+        done.append("Search embeddings")
+        return
+    res = _run([cm, "embeddings", choice])
+    if res.returncode == 0:
+        log("  ✓ " + res.stdout.strip().replace("\n", "\n    "))
+        done.append("Search embeddings")
+    else:
+        log("  ✗ " + (res.stderr or res.stdout).strip()[-400:])
+        todo.append(f"Set search embeddings: contorch-memory embeddings gemini|local|none")
+
+
 def setup(log=print) -> bool:
     """Everything scriptable, in order, then an honest list of what is left."""
     todo: list[str] = []
@@ -314,6 +358,10 @@ def setup(log=print) -> bool:
     else:
         log(f"  ✗ no key found, and no terminal to ask on — meeting transcription stays off")
         todo.append(f"Add a Gemini key: write it to {KEY_FILE} (chmod 600), then run `contorch setup` again")
+
+    # 1b. How search understands questions (context-orchestrator >= 0.4).
+    step("Search embeddings")
+    _setup_embeddings(log, todo, done)
 
     # 2. Move an older source install over, with a backup of the index.
     old = [a for a in agents()

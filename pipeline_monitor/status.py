@@ -105,6 +105,43 @@ def db_status() -> dict[str, Any]:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+# ----------------------------------------------------------- embeddings
+
+CO_ENV_FILE = CO_DIR / "env"
+GEMINI_KEY_FILE = HOME / ".config" / "google" / "key"
+
+
+def embeddings_status() -> dict[str, Any]:
+    """Which embedding model context-orchestrator uses (`contorch-memory
+    embeddings gemini|local|none`, stored as CO_EMBEDDING_MODEL in
+    ~/.context-orchestrator/env). "none" = keyword (full-text) search only.
+    Mirrors context_orchestrator.search.embedding_choice()."""
+    raw = os.environ.get("CO_EMBEDDING_MODEL", "")
+    if not raw:
+        try:
+            for line in CO_ENV_FILE.read_text(encoding="utf-8").splitlines():
+                k, _, v = line.strip().partition("=")
+                if k.strip().removeprefix("export ").strip() == "CO_EMBEDDING_MODEL":
+                    raw = v.strip().strip('"').strip("'")
+        except OSError:
+            pass
+    low = raw.strip().lower()
+    has_key = bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+                   or (GEMINI_KEY_FILE.exists() and GEMINI_KEY_FILE.stat().st_size > 0))
+    if low in ("none", "fts", "keyword"):
+        mode = "none"
+    elif low in ("off", "default", "local"):
+        mode = "local"
+    elif low in ("gemini",) or low.startswith("gemini-") or (not low and has_key):
+        mode = "gemini"
+    elif not low:
+        mode = "local"
+    else:
+        mode = raw
+    return {"ok": True, "mode": mode, "configured": raw or "auto",
+            "has_key": has_key, "off": mode == "none"}
+
+
 # ----------------------------------------------------------- MCP server log
 
 def _mcp_log_dir() -> Optional[Path]:
@@ -565,6 +602,7 @@ class Snapshot:
     capture_mode: dict[str, Any] = field(default_factory=dict)
     hook: dict[str, Any] = field(default_factory=dict)
     disk: dict[str, Any] = field(default_factory=dict)
+    embeddings: dict[str, Any] = field(default_factory=dict)
 
     def overall(self) -> str:
         """State for the menu bar icon: rec / rec_stale / perm / err / ok.
@@ -589,7 +627,9 @@ class Snapshot:
             # short of a live recording.
             return "perm"
         problems = []
-        if not self.chroma.get("ok"):
+        # With embeddings off there is no vector index to reach — keyword
+        # search runs on SQLite, so an absent chroma is not a problem.
+        if not self.chroma.get("ok") and not self.embeddings.get("off"):
             problems.append("chroma")
         for label, info in self.launchd.get("daemons", {}).items():
             if info.get("installed") and not info.get("running"):
@@ -622,6 +662,7 @@ def collect() -> Snapshot:
         capture_mode=capture_mode_status(),
         hook=hook_status(),
         disk=disk_status(),
+        embeddings=embeddings_status(),
     )
 
 

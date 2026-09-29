@@ -99,3 +99,22 @@ def test_mcp_add_puts_name_before_variadic_env():
     assert cmd[:6] == ["claude", "mcp", "add", "--scope", "user", ct.MCP_NAME]
     assert cmd[-2:] == ["--", "/bin/contorch-mcp"]
     assert cmd.index(ct.MCP_NAME) < cmd.index("-e")
+
+
+def test_setup_embeddings_writes_choice_and_keeps_it_when_non_interactive(monkeypatch):
+    calls = []
+
+    class R:
+        def __init__(self, out=""): self.returncode, self.stdout, self.stderr = 0, out, ""
+
+    def fake_run(cmd, timeout=300):
+        calls.append(cmd)
+        return R("none — keyword (full-text) search only" if cmd[-1] == "embeddings" else "embeddings: none")
+    monkeypatch.setattr(ct, "_run", fake_run)
+    monkeypatch.setattr(ct, "_contorch_memory_bin", lambda: "/x/contorch-memory")
+    monkeypatch.setattr(ct, "_interactive", lambda: False)
+    todo, done, log = [], [], []
+    ct._setup_embeddings(log.append, todo, done)                 # non-interactive: no change
+    assert calls == [["/x/contorch-memory", "embeddings"]] and done == ["Search embeddings"]
+    ct._setup_embeddings(log.append, todo, done, choice="none")  # explicit choice is written
+    assert calls[-1] == ["/x/contorch-memory", "embeddings", "none"]

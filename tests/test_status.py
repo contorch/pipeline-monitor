@@ -76,3 +76,33 @@ def test_recent_sessions_without_the_table_still_work(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "TRANSCRIPTS_DIR", tmp_path / "none")
     r = st.recordings_status()
     assert r["ok"] and r["sessions"] == [] and r["total_count"] == 0
+
+
+@pytest.mark.parametrize("line,env,key,mode", [
+    ("CO_EMBEDDING_MODEL=none\n", None, False, "none"),
+    ("CO_EMBEDDING_MODEL=gemini-embedding-001\n", None, True, "gemini"),
+    ("CO_EMBEDDING_MODEL=local\n", None, True, "local"),
+    ("", None, True, "gemini"),          # unset + key → auto Gemini
+    ("", None, False, "local"),          # unset, no key → local
+    ("CO_EMBEDDING_MODEL=local\n", "none", True, "none"),   # environment wins
+])
+def test_embeddings_mode_from_env_file(tmp_path, monkeypatch, line, env, key, mode):
+    f = tmp_path / "env"; f.write_text("# x\n" + line)
+    k = tmp_path / "key"
+    if key:
+        k.write_text("AIza-test")
+    monkeypatch.setattr(st, "CO_ENV_FILE", f)
+    monkeypatch.setattr(st, "GEMINI_KEY_FILE", k)
+    for v in ("GOOGLE_API_KEY", "GEMINI_API_KEY", "CO_EMBEDDING_MODEL"):
+        monkeypatch.delenv(v, raising=False)
+    if env:
+        monkeypatch.setenv("CO_EMBEDDING_MODEL", env)
+    e = st.embeddings_status()
+    assert e["mode"] == mode and e["off"] == (mode == "none")
+
+
+def test_chroma_down_is_not_an_error_when_embeddings_are_off():
+    snap = st.Snapshot(chroma={"ok": False, "error": "refused"}, embeddings={"off": True})
+    assert snap.overall() == "ok"
+    snap = st.Snapshot(chroma={"ok": False, "error": "refused"}, embeddings={"off": False, "mode": "gemini"})
+    assert snap.overall() == "err"

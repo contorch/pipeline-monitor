@@ -197,12 +197,23 @@ def _meeting_capture_bin() -> str | None:
 
 
 def _build_index_line(snap: st.Snapshot) -> rumps.MenuItem:
-    """One line summarising the chroma + sqlite state."""
+    """One line summarising the chroma + sqlite state, and how search
+    understands questions (embedding model — or "keyword only" when off)."""
     c = snap.chroma
     d = snap.db
+    e = snap.embeddings or {}
+    if e.get("off"):
+        parts = ["keyword search only — embeddings off"]
+        if d.get("ok"):
+            parts.append(f"{d.get('repo_knowledge', 0)} insights")
+        return rumps.MenuItem("Index: " + " · ".join(parts))
     if not c.get("ok"):
         return rumps.MenuItem(f"⚠ Index: {_truncate(c.get('error', 'unreachable'), 50)}")
     parts = [f"{c.get('doc_count', '?')} docs"]
+    if e.get("mode") == "gemini" and not e.get("has_key"):
+        parts.append("Gemini (no key → keyword only)")
+    elif e.get("mode"):
+        parts.append({"gemini": "Gemini", "local": "local model"}.get(e["mode"], e["mode"]))
     if d.get("ok"):
         parts.append(f"{d.get('repo_knowledge', 0)} insights")
         if d.get("last_repo_knowledge"):
@@ -310,6 +321,11 @@ def _build_details_submenu(snap: st.Snapshot) -> rumps.MenuItem:
     c = snap.chroma
     if c.get("ok"):
         submenu.add(rumps.MenuItem(f"Chroma: {c.get('doc_count')} docs @ {c.get('dim')}d"))
+    e = snap.embeddings or {}
+    if e:
+        submenu.add(rumps.MenuItem(
+            "Embeddings: off (keyword search only)" if e.get("off")
+            else f"Embeddings: {e.get('mode')} (setting: {e.get('configured')})"))
 
     # SQLite breakdown
     d = snap.db

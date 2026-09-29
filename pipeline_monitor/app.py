@@ -269,9 +269,10 @@ def _build_recent_submenu(snap: st.Snapshot) -> rumps.MenuItem:
         return submenu
     for sess in sessions[:10]:
         size_kb = sess["size"] / 1024
-        title = f"{sess['name']} · {size_kb:.0f}KB · {_ago(sess['age_s'])}"
-        submenu.add(rumps.MenuItem(_truncate(title, 70),
-                                   callback=_open_path_callback(sess["path"])))
+        title = f"{sess.get('title') or sess['name']} · {size_kb:.0f}KB · {_ago(sess['age_s'])}"
+        cb = (_open_path_callback(sess["path"]) if sess.get("path")
+              else _open_transcript_callback(sess["meeting_id"]))
+        submenu.add(rumps.MenuItem(_truncate(title, 70), callback=cb))
     return submenu
 
 
@@ -338,6 +339,18 @@ def _build_details_submenu(snap: st.Snapshot) -> rumps.MenuItem:
 def _open_path_callback(path: str):
     def _cb(_):
         subprocess.Popen(["open", path])
+    return _cb
+
+
+def _open_transcript_callback(meeting_id: str):
+    """Transcripts live in the database, not in files: pipe the text to the
+    default text editor (`open -f`) instead of opening a path."""
+    def _cb(_):
+        text = st.transcript_text(meeting_id)
+        if text is None:
+            rumps.notification("contorch", "Transcript not found", meeting_id)
+            return
+        subprocess.run(["open", "-f"], input=text.encode("utf-8"), check=False)
     return _cb
 
 
@@ -454,8 +467,26 @@ class PipelineMonitor(rumps.App):
         rumps.alert(title=title, message=body, ok="OK")
         self._refresh_callback(None)
 
-    def _on_open_transcripts(self, _):
-        _open_dir_callback(st.TRANSCRIPTS_DIR)(_)
+    def _on_open_latest_transcript(self, _):
+        sessions = (self._snap.recordings.get("sessions") if self._snap else None) or []
+        if not sessions:
+            rumps.notification("contorch", "No transcripts yet", "")
+            return
+        s = sessions[0]
+        (_open_path_callback(s["path"]) if s.get("path")
+         else _open_transcript_callback(s["meeting_id"]))(_)
+
+    def _on_recording_settings(self, _):
+        """`meeting-capture ui`: source (this Mac / USB interface), device,
+        host/guest inputs with live level meters, pause. It reopens an
+        already-running page, so repeated clicks are safe."""
+        mc = _meeting_capture_bin()
+        if not mc:
+            rumps.notification("contorch", "meeting-capture not found",
+                               "Install it: brew install contorch/tap/contorch")
+            return
+        subprocess.Popen([mc, "ui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
 
     def _on_open_co_dir(self, _):
         _open_dir_callback(st.CO_DIR)(_)
@@ -571,11 +602,12 @@ class PipelineMonitor(rumps.App):
         self.menu.add(rumps.MenuItem("Refresh", callback=self._on_refresh_now))
         self.menu.add(rumps.MenuItem("Run smoke test", callback=self._on_smoke_test))
         open_submenu = rumps.MenuItem("Open")
-        open_submenu.add(rumps.MenuItem("Transcripts folder", callback=self._on_open_transcripts))
+        open_submenu.add(rumps.MenuItem("Latest transcript", callback=self._on_open_latest_transcript))
         open_submenu.add(rumps.MenuItem("~/.context-orchestrator", callback=self._on_open_co_dir))
         open_submenu.add(rumps.MenuItem("MCP log", callback=self._on_open_mcp_log))
         self.menu.add(open_submenu)
         self.menu.add(rumps.MenuItem("Restart chroma", callback=self._on_restart_chroma))
+        self.menu.add(rumps.MenuItem("Recording settings…", callback=self._on_recording_settings))
         self.menu.add(self._build_mode_toggle(snap))
         self.menu.add(self._build_stack_toggle())
         self.menu.add(rumps.separator)

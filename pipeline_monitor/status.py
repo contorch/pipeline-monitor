@@ -270,36 +270,75 @@ def launchd_status() -> dict[str, Any]:
 # ----------------------------------------------------------- recordings dir
 
 def recordings_status(limit: int = 15) -> dict[str, Any]:
-    """Recent transcript files + sizes."""
-    out: dict[str, Any] = {"ok": False, "dir": str(TRANSCRIPTS_DIR)}
-    if not TRANSCRIPTS_DIR.is_dir():
-        out["error"] = "no transcripts dir"
-        return out
+    """Recent transcripts. meeting-capture >= 0.5 / context-orchestrator >= 0.4
+    keep them in context.db (table `transcripts`, full text in `body`); older
+    installs wrote ~/transcripts/*.md. Both are listed, newest first."""
+    out: dict[str, Any] = {"ok": False, "dir": str(TRANSCRIPTS_DIR), "db": str(CO_DB)}
+    sessions: list[dict[str, Any]] = []
+    total = 0
+    now = time.time()
     try:
-        files = sorted(
-            TRANSCRIPTS_DIR.glob("*.md"),
-            key=lambda f: f.stat().st_mtime,
-            reverse=True,
-        )[:limit]
-        sessions = []
-        for f in files:
-            st = f.stat()
-            sessions.append({
-                "name": f.name,
-                "path": str(f),
-                "size": st.st_size,
-                "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
-                "age_s": int(time.time() - st.st_mtime),
-            })
-        out["sessions"] = sessions
-        out["total_count"] = sum(1 for _ in TRANSCRIPTS_DIR.glob("*.md"))
+        if CO_DB.exists():
+            conn = sqlite3.connect(f"file:{CO_DB}?mode=ro", uri=True, timeout=2)
+            try:
+                has = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                   "AND name='transcripts'").fetchone()
+                if has:
+                    total += conn.execute("SELECT COUNT(*) FROM transcripts").fetchone()[0]
+                    for mid, title, size, updated in conn.execute(
+                            "SELECT meeting_id, title, length(body), updated_at FROM transcripts "
+                            "ORDER BY updated_at DESC LIMIT ?", (limit,)):
+                        sessions.append({
+                            "name": mid, "title": title or mid, "meeting_id": mid, "path": None,
+                            "size": size or 0,
+                            "mtime": datetime.fromtimestamp(updated).isoformat(timespec="seconds"),
+                            "age_s": int(now - updated),
+                        })
+            finally:
+                conn.close()
+        if TRANSCRIPTS_DIR.is_dir():
+            files = list(TRANSCRIPTS_DIR.glob("*.md"))
+            total += len(files)
+            for f in sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)[:limit]:
+                st = f.stat()
+                sessions.append({
+                    "name": f.name, "title": f.stem, "meeting_id": None, "path": str(f),
+                    "size": st.st_size,
+                    "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+                    "age_s": int(now - st.st_mtime),
+                })
+        if not CO_DB.exists() and not TRANSCRIPTS_DIR.is_dir():
+            out["error"] = "no transcripts yet"
+            return out
+        sessions.sort(key=lambda x: x["age_s"])
+        out["sessions"] = sessions[:limit]
+        out["total_count"] = total
         out["ok"] = True
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
     return out
 
 
+def transcript_text(meeting_id: str) -> str | None:
+    """Full text of a stored transcript (read-only)."""
+    try:
+        conn = sqlite3.connect(f"file:{CO_DB}?mode=ro", uri=True, timeout=2)
+        try:
+            row = conn.execute("SELECT body FROM transcripts WHERE meeting_id = ?",
+                               (meeting_id,)).fetchone()
+        finally:
+            conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
 # ----------------------------------------------------------- meeting-capture
+
+# `chunk 9.1s [them] -> meeting-2026-05-03T21-37-42.md (226 chars)` (<= 0.4)
+# `chunk 9.1s [them] -> meeting-2026-05-03T21-37-42 (226 chars)`    (>= 0.5)
+_CHUNK_RE = re.compile(r"\bINFO chunk \d+(?:\.\d+)?s (?:\[\w+\] )?-> (\S+?) \(\d+ chars\)")
+_SESSION_RE = re.compile(r"new session:\s*(meeting-\S+)", re.IGNORECASE)
 
 def recording_status() -> dict[str, Any]:
     """Is meeting-capture currently recording? Heuristic: read its log tail.
@@ -307,8 +346,10 @@ def recording_status() -> dict[str, Any]:
     meeting-capture daemon's actual log vocabulary (verified May 2026):
       • `mic active — starting recording session`           → start
       • `sysaudio: stream started, piping PCM to stdout`    → start (sub-event)
-      • `new session: meeting-2026-05-03T21-37-42.md`       → start (gives filename)
-      • `INFO chunk 9.1s [them] -> meeting-...md (226 chars)` → live (chunk landed; role tag [them]/[me] since v0.2.0)
+      • `new session: meeting-2026-05-03T21-37-42[.md]`     → start (gives the meeting)
+      • `INFO chunk 9.1s [them] -> meeting-...[.md] (226 chars)` → live (chunk landed; role tag [them]/[me] since v0.2.0)
+    meeting-capture >= 0.5.0 stores transcripts in the database and logs the
+    meeting id without `.md`; older versions log the file name. Both match.
       • `mic inactive — session ended`                      → stop
       • `sysaudio error: ... "The user declined TCCs ..."`  → permission denied
     Walks the tail backwards and returns the most recent state event.
@@ -413,9 +454,7 @@ def recording_status() -> dict[str, Any]:
             # START sentinels — any of these means we're mid-recording.
             # Match against the original case-preserved line so the
             # filename keeps its `T` separator (`meeting-...T13-01-53.md`).
-            chunk_match = re.search(
-                r"\bINFO chunk \d+(?:\.\d+)?s (?:\[\w+\] )?-> (\S+\.md)", line
-            )
+            chunk_match = _CHUNK_RE.search(line)
             if (
                 "mic active" in low
                 or "starting recording session" in low
@@ -440,9 +479,7 @@ def recording_status() -> dict[str, Any]:
                     if chunk_match is not None:
                         current_file = chunk_match.group(1)
                     else:
-                        sess_matches = re.findall(
-                            r"new session:\s*(\S+\.md)", tail, re.IGNORECASE
-                        )
+                        sess_matches = _SESSION_RE.findall(tail)
                         if sess_matches:
                             current_file = sess_matches[-1]
                 # Find the AGE of the newest chunk specifically (not just any
@@ -450,7 +487,7 @@ def recording_status() -> dict[str, Any]:
                 # daemon is alive but no PCM is reaching the chunker (e.g.
                 # another SCK consumer stole system audio capture).
                 for inner in reversed(lines):
-                    if re.search(r"\bINFO chunk \d+(?:\.\d+)?s (?:\[\w+\] )?-> (\S+\.md)", inner):
+                    if _CHUNK_RE.search(inner):
                         a = _age_seconds(inner)
                         if a is not None:
                             last_chunk_age_s = a
@@ -498,7 +535,6 @@ def disk_status() -> dict[str, Any]:
         for label, path in [
             ("context-orchestrator", CO_DIR),
             ("chroma", CO_CHROMA_DIR),
-            ("transcripts", TRANSCRIPTS_DIR),
             ("meeting-capture", MEETING_CAPTURE_DIR),
         ]:
             if path.is_dir():

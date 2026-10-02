@@ -268,7 +268,9 @@ def _build_system_line(snap: st.Snapshot) -> rumps.MenuItem:
 
 
 def _build_recent_submenu(snap: st.Snapshot) -> rumps.MenuItem:
-    """Submenu listing recent sessions. Click any to open."""
+    """Submenu listing recent sessions. Each one has its own submenu:
+    Copy transcript (the whole text to the clipboard) and Open in TextEdit.
+    macOS menus have no per-item right-click, so this is the equivalent."""
     r = snap.recordings
     sessions = r.get("sessions", []) if r.get("ok") else []
     label = f"Recent sessions ({len(sessions)})" if sessions else "Recent sessions (none yet)"
@@ -281,9 +283,13 @@ def _build_recent_submenu(snap: st.Snapshot) -> rumps.MenuItem:
     for sess in sessions[:10]:
         size_kb = sess["size"] / 1024
         title = f"{sess.get('title') or sess['name']} · {size_kb:.0f}KB · {_ago(sess['age_s'])}"
-        cb = (_open_path_callback(sess["path"]) if sess.get("path")
-              else _open_transcript_callback(sess["meeting_id"]))
-        submenu.add(rumps.MenuItem(_truncate(title, 70), callback=cb))
+        item = rumps.MenuItem(_truncate(title, 70))
+        item.add(rumps.MenuItem("Copy transcript", callback=_copy_transcript_callback(sess)))
+        item.add(rumps.MenuItem(
+            "Open in TextEdit",
+            callback=(_open_path_callback(sess["path"]) if sess.get("path")
+                      else _open_transcript_callback(sess["meeting_id"]))))
+        submenu.add(item)
     return submenu
 
 
@@ -367,6 +373,37 @@ def _open_transcript_callback(meeting_id: str):
             rumps.notification("contorch", "Transcript not found", meeting_id)
             return
         subprocess.run(["open", "-f"], input=text.encode("utf-8"), check=False)
+    return _cb
+
+
+def _session_text(sess: dict) -> str | None:
+    """Full transcript text for a Recent-sessions entry (database row, or a
+    legacy ~/transcripts file)."""
+    if sess.get("meeting_id"):
+        return st.transcript_text(sess["meeting_id"])
+    try:
+        return Path(sess["path"]).read_text(encoding="utf-8", errors="replace")
+    except (OSError, KeyError, TypeError):
+        return None
+
+
+def copy_to_clipboard(text: str) -> bool:
+    res = subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
+    return res.returncode == 0
+
+
+def _copy_transcript_callback(sess: dict):
+    def _cb(_):
+        text = _session_text(sess)
+        name = sess.get("title") or sess.get("name") or "transcript"
+        if not text:
+            rumps.notification("contorch", "Transcript not found", name)
+            return
+        if copy_to_clipboard(text):
+            rumps.notification("contorch", "Transcript copied",
+                               f"{name} — {len(text.split()):,} words on the clipboard")
+        else:
+            rumps.notification("contorch", "Couldn't copy the transcript", name)
     return _cb
 
 

@@ -132,3 +132,27 @@ def test_start_new_meeting_runs_meeting_capture_new(monkeypatch):
     app.PipelineMonitor._on_new_meeting(object(), None)
     assert calls == [["/x/meeting-capture", "new"]]
     assert notes and notes[0][1] == "New meeting started"
+
+
+def test_copy_transcript_puts_the_whole_text_on_the_clipboard(monkeypatch):
+    import pipeline_monitor.app as app
+    body = "# Meeting transcript m\n\n[13:31:39] **Me:** hello there\n\n[13:32:41] **Them:** hi back\n"
+    monkeypatch.setattr(app.st, "transcript_text", lambda mid: body if mid == "m" else None)
+    clip, notes = [], []
+    monkeypatch.setattr(app.subprocess, "run",
+                        lambda cmd, input=None, check=False: clip.append((cmd, input)) or type("R", (), {"returncode": 0})())
+    monkeypatch.setattr(app.rumps, "notification", lambda *a: notes.append(a))
+    app._copy_transcript_callback({"meeting_id": "m", "title": "m"})(None)
+    assert clip == [(["pbcopy"], body.encode())]
+    assert notes[0][1] == "Transcript copied"
+    app._copy_transcript_callback({"meeting_id": "missing", "title": "x"})(None)
+    assert notes[-1][1] == "Transcript not found" and len(clip) == 1
+
+
+def test_recent_sessions_each_have_copy_and_open(monkeypatch):
+    import pipeline_monitor.app as app
+    snap = app.st.Snapshot(recordings={"ok": True, "sessions": [
+        {"name": "m1", "title": "m1", "meeting_id": "m1", "path": None, "size": 2048, "age_s": 60}]})
+    menu = app._build_recent_submenu(snap)
+    (item,) = list(menu.values())
+    assert [i.title for i in item.values()] == ["Copy transcript", "Open in TextEdit"]

@@ -15,7 +15,7 @@ Glanceable state in the menu bar — `○` idle / `● REC` recording / `⚠` so
 | Section | Data |
 |---|---|
 | **NOW** | Recording state + current meeting (from the meeting-capture daemon log) |
-| **RECENT SESSIONS** | Last 10 transcripts (from the context-orchestrator database; legacy `~/transcripts/*.md` too). Click to open the text. |
+| **RECENT SESSIONS** | Last 10 transcripts (from the context-orchestrator database; legacy `~/transcripts/*.md` too). Each has **Copy transcript** (whole text to the clipboard) and **Open in TextEdit**. |
 | **INDEX HEALTH** | Chroma doc count + embedding dim · SQLite tasks/sources/insights · last insight age |
 | **MCP / CONNECTIONS** | MCP server activity · last tool call (tool, result, latency, ago) · auto-context hook last fire (ago + latency + chars injected) · expandable timeline of last 20 calls |
 | **SYSTEM HEALTH** | launchd daemon status with PIDs · disk usage per data dir |

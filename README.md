@@ -19,7 +19,7 @@ Glanceable state in the menu bar — `○` idle / `● REC` recording / `⚠` so
 | **INDEX HEALTH** | Chroma doc count + embedding dim · SQLite tasks/sources/insights · last insight age |
 | **MCP / CONNECTIONS** | MCP server activity · last tool call (tool, result, latency, ago) · auto-context hook last fire (ago + latency + chars injected) · expandable timeline of last 20 calls |
 | **SYSTEM HEALTH** | launchd daemon status with PIDs · disk usage per data dir |
-| **Actions** | Refresh now · Run end-to-end smoke test · **Recording settings…** (`meeting-capture ui`: source, USB-interface inputs, live levels) · Open latest transcript/CO dir/MCP log · Restart chroma daemon · capture mode · Stop/Resume everything · Quit |
+| **Actions** | Refresh now · Run end-to-end smoke test · **Start new meeting** (`meeting-capture new` — next speech opens a new transcript) · **Recording settings…** (`meeting-capture ui`: source, USB-interface inputs, live levels) · Open latest transcript/CO dir/MCP log · Restart chroma daemon · capture mode · Stop/Resume everything · Quit |
 
 End-to-end smoke test: inserts a marker doc → searches for it → deletes it. One-click "is the whole stack actually working right now?" check. Reports rank + latency in a notification.
 

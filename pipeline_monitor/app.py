@@ -492,6 +492,23 @@ class PipelineMonitor(rumps.App):
         (_open_path_callback(s["path"]) if s.get("path")
          else _open_transcript_callback(s["meeting_id"]))(_)
 
+    def _on_new_meeting(self, _):
+        """`meeting-capture new`: speech from now on goes into a new
+        transcript (back-to-back meetings otherwise share one until there
+        are 15 minutes without speech)."""
+        mc = _meeting_capture_bin()
+        if not mc:
+            rumps.notification("contorch", "meeting-capture not found",
+                               "Install it: brew install contorch/tap/contorch")
+            return
+        res = subprocess.run([mc, "new"], capture_output=True, text=True, timeout=30)
+        if res.returncode == 0:
+            rumps.notification("contorch", "New meeting started",
+                               "Speech from now on goes into a new transcript.")
+        else:
+            rumps.notification("contorch", "Couldn't start a new meeting",
+                               (res.stderr or res.stdout).strip()[-200:])
+
     def _on_recording_settings(self, _):
         """`meeting-capture ui`: source (this Mac / USB interface), device,
         host/guest inputs with live level meters, pause. It reopens an
@@ -623,6 +640,7 @@ class PipelineMonitor(rumps.App):
         open_submenu.add(rumps.MenuItem("MCP log", callback=self._on_open_mcp_log))
         self.menu.add(open_submenu)
         self.menu.add(rumps.MenuItem("Restart chroma", callback=self._on_restart_chroma))
+        self.menu.add(rumps.MenuItem("Start new meeting", callback=self._on_new_meeting))
         self.menu.add(rumps.MenuItem("Recording settings…", callback=self._on_recording_settings))
         self.menu.add(self._build_mode_toggle(snap))
         self.menu.add(self._build_stack_toggle())

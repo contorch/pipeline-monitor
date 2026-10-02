@@ -118,3 +118,17 @@ def test_setup_embeddings_writes_choice_and_keeps_it_when_non_interactive(monkey
     assert calls == [["/x/contorch-memory", "embeddings"]] and done == ["Search embeddings"]
     ct._setup_embeddings(log.append, todo, done, choice="none")  # explicit choice is written
     assert calls[-1] == ["/x/contorch-memory", "embeddings", "none"]
+
+
+def test_start_new_meeting_runs_meeting_capture_new(monkeypatch):
+    import pipeline_monitor.app as app
+    calls, notes = [], []
+    monkeypatch.setattr(app, "_meeting_capture_bin", lambda: "/x/meeting-capture")
+
+    class R:
+        returncode, stdout, stderr = 0, "new meeting", ""
+    monkeypatch.setattr(app.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or R())
+    monkeypatch.setattr(app.rumps, "notification", lambda *a: notes.append(a))
+    app.PipelineMonitor._on_new_meeting(object(), None)
+    assert calls == [["/x/meeting-capture", "new"]]
+    assert notes and notes[0][1] == "New meeting started"

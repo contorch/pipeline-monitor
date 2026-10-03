@@ -183,6 +183,33 @@ def _build_status_line(snap: st.Snapshot) -> rumps.MenuItem:
     return rumps.MenuItem(f"○ Idle{mode}")
 
 
+def _build_transcription_line(snap: st.Snapshot) -> rumps.MenuItem | None:
+    """'Transcription: on this Mac (en-US)' / 'Gemini' / '⚠ … unavailable — why'.
+    None when meeting-capture isn't installed (the status line says so)."""
+    t = snap.transcription or {}
+    if not t.get("ok"):
+        return None
+    text = f"Transcription: {t.get('label') or '?'}"
+    if t.get("engine") == "none":
+        return rumps.MenuItem(f"⚠ {_truncate(text, 90)}")
+    return rumps.MenuItem(text)
+
+
+def _transcription_details(snap: st.Snapshot) -> list[str]:
+    """Details-submenu lines: the setting, on-device state, key."""
+    t = snap.transcription or {}
+    if not t.get("ok"):
+        return [f"Transcription: {_truncate(t['error'], 60)}"] if t.get("error") else []
+    lines = [f"Transcription: {_truncate(t.get('label') or '?', 70)}",
+             f"  setting: {t.get('setting')} · locale {t.get('locale')}"]
+    p = t.get("probe") or {}
+    if p.get("status") not in (None, "skipped"):
+        on_device = "ready" if p.get("usable") else _truncate(p.get("reason") or p.get("status"), 60)
+        lines.append(f"  on-device: {on_device}")
+    lines.append(f"  Gemini key: {'yes' if t.get('has_key') else 'none'}")
+    return lines
+
+
 def _meeting_capture_bin() -> str | None:
     """The meeting-capture CLI. launchd does not give this app a shell PATH,
     so fall back to the brew wrapper and then the daemon's own venv."""
@@ -332,6 +359,8 @@ def _build_details_submenu(snap: st.Snapshot) -> rumps.MenuItem:
         submenu.add(rumps.MenuItem(
             "Embeddings: off (keyword search only)" if e.get("off")
             else f"Embeddings: {e.get('mode')} (setting: {e.get('configured')})"))
+    for line in _transcription_details(snap):
+        submenu.add(rumps.MenuItem(line))
 
     # SQLite breakdown
     d = snap.db
@@ -652,6 +681,9 @@ class PipelineMonitor(rumps.App):
         self.menu.clear()
 
         self.menu.add(_build_status_line(snap))
+        tline = _build_transcription_line(snap)
+        if tline is not None:
+            self.menu.add(tline)
         self.menu.add(rumps.separator)
 
         self.menu.add(_build_index_line(snap))

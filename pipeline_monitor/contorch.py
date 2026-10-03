@@ -1,8 +1,8 @@
 """`contorch` — one command for the whole contorch stack.
 
     contorch setup      configure everything after `brew install contorch/tap/contorch`
-    contorch doctor     health-check every component
-    contorch status     what is installed, running, stopped
+    contorch doctor     health-check every component (incl. the transcription engine)
+    contorch status     what is installed, running, stopped; how meetings are transcribed
     contorch stop       stop every background daemon, and keep them stopped across login
     contorch resume     start them again, in dependency order, and check they came up
 
@@ -25,6 +25,8 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+
+from . import transcription as stt
 
 LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
 STATE_DIR = Path.home() / ".contorch"
@@ -199,13 +201,77 @@ def _run(cmd: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
+KEY_VARS = ("GOOGLE_API_KEY", "GEMINI_API_KEY")   # meeting-capture's lookup order
+
+
 def _have_key() -> bool:
-    if os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"):
+    """A key in this shell or the key file. Right for things started from the
+    shell; NOT for the recorder, which runs under launchd — see _recorder_key()."""
+    if any(os.environ.get(v) for v in KEY_VARS):
         return True
+    return _key_file_has_key()
+
+
+def _key_file_has_key() -> bool:
     try:
         return KEY_FILE.is_file() and KEY_FILE.read_text().strip() != ""
     except OSError:
         return False
+
+
+def _key_out_of_reach(env: dict) -> tuple[str, str, str] | None:
+    """A Gemini key that exists here but that the recorder will not have once
+    setup is done, as (key, where it is, why the recorder can't use it); None
+    if there is none.
+
+    The recorder is a launchd agent: it never sees this shell's environment
+    (a key exported in ~/.zshrc), and `meeting-capture install`, which setup
+    runs, rewrites the agent's plist env with only PATH and MEETING_CAPTURE_*,
+    so a key put there by hand is dropped too. After setup the key file is the
+    only place it reads a key from."""
+    sources = (
+        (os.environ, "your shell",
+         "it runs in the background under launchd and never sees your shell's environment"),
+        (env, "its launchd plist",
+         "`meeting-capture install`, which setup runs, rewrites that plist without it"),
+    )
+    for source, where, why in sources:
+        for var in KEY_VARS:
+            v = str(source.get(var) or "").strip()
+            if v:
+                return v, f"{var} in {where}", why
+    return None
+
+
+def _recorder_key(env: dict, log) -> bool:
+    """Will the recorder find a Gemini key after setup? The key file, or a key
+    from the shell / plist env that the user agrees to save there."""
+    if _key_file_has_key():
+        log(f"  ✓ Gemini key found ({KEY_FILE})")
+        return True
+    found = _key_out_of_reach(env)
+    if found is None:
+        return False
+    key, where, why = found
+    log(f"  ! The recorder can't use {where}:")
+    log(f"    {why}.")
+    log(f"    It reads its Gemini key from {KEY_FILE}.")
+    if not _interactive():
+        return False
+    ans = input(f"  Save that key to {KEY_FILE} (readable only by you)? [Y/n] ").strip().lower()
+    if ans in ("", "y", "yes"):
+        _write_key(key)
+        log(f"  ✓ saved to {KEY_FILE} (readable only by you)")
+        return True
+    log("  · not saved")
+    return False
+
+
+def _key_todo(env: dict) -> str:
+    """How to give the recorder a key, naming a key it can't see if there is one."""
+    found = _key_out_of_reach(env)
+    note = f" (the recorder can't use {found[1]})" if found else ""
+    return f"write the key to {KEY_FILE} (chmod 600){note}"
 
 
 def _write_key(key: str) -> None:
@@ -314,6 +380,137 @@ def _setup_embeddings(log, todo: list, done: list, choice: str | None = None) ->
         todo.append(f"Set search embeddings: contorch-memory embeddings gemini|local|none")
 
 
+STT_UPGRADE = (
+    "Gemini is an optional upgrade: it gets names and codenames right more often,",
+    "labels who is speaking, and writes Hindi in Devanagari (on-device Hindi comes",
+    "out romanized). It also works on older Macs. With Gemini, meeting audio is",
+    "uploaded to Google for transcription.",
+)
+
+
+def _ask_for_key(log) -> bool:
+    """Open AI Studio and read a key (hidden). True if one was saved."""
+    log(f"  Opening {AI_STUDIO} — create a key, then paste it here.")
+    _run(["open", AI_STUDIO])
+    key = getpass.getpass("  Gemini API key (input hidden, Enter to skip): ").strip()
+    if not key:
+        return False
+    _write_key(key)
+    log(f"  ✓ saved to {KEY_FILE} (readable only by you)")
+    return True
+
+
+def _setup_transcription(log, todo: list, done: list) -> str | None:
+    """Choose how meetings are transcribed.
+
+    On a Mac that can do it (macOS 26+, Apple silicon, meeting-capture whose
+    sysaudio has `transcribe`), transcription runs on this Mac and needs no
+    key; Gemini is offered as an optional upgrade and skipping it is not a
+    to-do. Elsewhere a Gemini key is what makes transcription work at all, as
+    before. The engine setting itself (MEETING_CAPTURE_STT) is meeting-capture's:
+    this returns the `meeting-capture stt` value to apply once the recorder is
+    installed, or None to leave it as it is.
+
+    "Has a key" means a key the recorder (a launchd agent) will see after
+    setup, i.e. the key file — never this shell's environment. Gemini is only
+    chosen, and only reported as working, when that holds.
+    """
+    env = stt.plist_env()
+    setting = stt.setting_from_env(env)
+    locale = stt.locale_from_env(env)
+    helper = stt.find_helper(env)
+    probe = stt.probe(helper, locale)
+    if probe["status"] == "needs_model" and setting != "gemini" and helper:
+        log(f"  Downloading Apple's speech model for {locale} (one time)…")
+        res = stt.install_model(helper, locale)
+        if res["ok"]:
+            probe = stt.probe(helper, locale)
+        else:
+            log(f"  ! could not install it: {res['error']}")
+
+    if probe["usable"]:
+        loc = probe.get("locale") or locale
+        log(f"  ✓ This Mac can transcribe meetings itself (Apple on-device speech, {loc}).")
+        if setting == "gemini":
+            log("    No API key needed for that. Right now transcription is set to Gemini.")
+        else:
+            log("    No API key needed, and the audio never leaves this Mac.")
+        want = "gemini" if setting == "gemini" else "mac"
+        if _interactive():
+            log("")
+            for line in STT_UPGRADE:
+                log("  " + line)
+            default = "2" if want == "gemini" else "1"
+            log(f"    1. On this Mac{'  (default)' if default == '1' else ''}")
+            log(f"    2. Gemini — needs a free API key{'  (default)' if default == '2' else ''}")
+            ans = input("  Choose 1-2 (Enter for default): ").strip() or default
+            want = "gemini" if ans == "2" else "mac"
+        key = False
+        if want == "gemini":
+            key = _recorder_key(env, log)
+            if not key and _interactive() and _key_out_of_reach(env) is None:
+                key = _ask_for_key(log)
+            if not key and _interactive():
+                log("  · no key the recorder can use — transcription stays on this Mac")
+                want = "mac"
+        if want == "gemini":
+            if not key:
+                # Only reachable non-interactively: already set to Gemini, no key the
+                # recorder can see. Leave the setting alone and say how to fix it.
+                log("  ✗ transcription is set to Gemini, but the recorder has no Gemini key")
+                todo.append(f"Transcription is set to Gemini but the recorder has no key: {_key_todo(env)}, "
+                            "or transcribe on this Mac: meeting-capture stt auto")
+                return None
+            log("  Meeting audio is sent to Google Gemini for transcription; transcripts")
+            log("  and the search index stay on this Mac.")
+            done.append("Transcription with Gemini")
+            return None if setting == "gemini" else "gemini"
+        change = "auto" if setting == "gemini" else None
+        log("  Transcripts and the search index stay on this Mac too.")
+        if (change or setting) == "auto" and _key_file_has_key():
+            log("  (You have a Gemini key, so if on-device speech ever stops working, Gemini")
+            log("   takes over; `meeting-capture stt apple` keeps audio on this Mac always.)")
+        done.append(f"Transcription on this Mac ({loc})")
+        return change
+
+    reason = probe.get("reason") or "unavailable"
+    if setting == "apple":
+        log(f"  ✗ On-device transcription is unavailable: {reason}")
+        log("    It is set to on-device only, so recordings wait on this Mac until it works.")
+        todo.append(f"Transcription is waiting for on-device speech ({reason}). "
+                    "To use Gemini instead: meeting-capture stt auto, and add a Gemini key")
+        return None
+    if setting == "gemini":
+        log("  Transcription is set to Gemini (`meeting-capture stt auto` to use this Mac when it can).")
+    else:
+        log(f"  · On-device transcription isn't available here: {reason}")
+    log("  Meeting audio is sent to Google Gemini for transcription (this needs a")
+    log("  Gemini API key); transcripts and the search index stay on this Mac.")
+    if _recorder_key(env, log):
+        done.append("Gemini key")
+        return None
+    if _interactive() and _key_out_of_reach(env) is None and _ask_for_key(log):
+        done.append("Gemini key")
+        return None
+    if not _interactive():
+        log("  ✗ no key the recorder can use, and no terminal to ask on — meeting transcription stays off")
+    todo.append(f"Add a Gemini key: {_key_todo(env)}, then run `contorch setup` again")
+    return None
+
+
+def _apply_stt(mc: str, change: str | None, log, todo: list) -> None:
+    """Set the engine through meeting-capture (it owns the plist env and
+    restarts its daemon)."""
+    if not change:
+        return
+    res = _run([mc, "stt", change], timeout=120)
+    if res.returncode == 0:
+        log(f"  ✓ transcription engine: {change}")
+    else:
+        log("  ✗ could not set the transcription engine: " + (res.stderr or res.stdout).strip()[-300:])
+        todo.append(f"Set the transcription engine: meeting-capture stt {change}")
+
+
 def setup(log=print) -> bool:
     """Everything scriptable, in order, then an honest list of what is left."""
     todo: list[str] = []
@@ -336,28 +533,12 @@ def setup(log=print) -> bool:
     claude = shutil.which("claude")
     log("  ✓ Claude Code" if claude else "  ! Claude Code not found — meetings will be captured but not connected to Claude")
 
-    log("\n  contorch records meeting audio when another app uses your microphone.")
-    log("  Audio is sent to Google Gemini for transcription; transcripts and the")
-    log("  search index stay on this Mac.")
+    log("\n  contorch records meeting audio when another app uses your microphone")
+    log("  and turns it into searchable transcripts.")
 
-    # 1. Gemini key
-    step("Gemini API key (needed for transcription)")
-    if _have_key():
-        log(f"  ✓ found ({'environment' if not KEY_FILE.is_file() else KEY_FILE})")
-        done.append("Gemini key")
-    elif _interactive():
-        log(f"  Opening {AI_STUDIO} — create a key, then paste it here.")
-        _run(["open", AI_STUDIO])
-        key = getpass.getpass("  Gemini API key (input hidden, Enter to skip): ").strip()
-        if key:
-            _write_key(key)
-            log(f"  ✓ saved to {KEY_FILE} (readable only by you)")
-            done.append("Gemini key")
-        else:
-            todo.append(f"Add a Gemini key: write it to {KEY_FILE} (chmod 600), then run `contorch setup` again")
-    else:
-        log(f"  ✗ no key found, and no terminal to ask on — meeting transcription stays off")
-        todo.append(f"Add a Gemini key: write it to {KEY_FILE} (chmod 600), then run `contorch setup` again")
+    # 1. Transcription: on this Mac when it can (no key), else Gemini (key).
+    step("Transcription")
+    stt_change = _setup_transcription(log, todo, done)
 
     # 1b. How search understands questions (context-orchestrator >= 0.4).
     step("Search embeddings")
@@ -439,6 +620,7 @@ def setup(log=print) -> bool:
     _launchctl("enable", f"gui/{_uid()}/com.contorch.meeting-capture")
     sysaudio = _plist_env("com.contorch.meeting-capture").get("MEETING_CAPTURE_SYSAUDIO", "")
     log("  ✓ capture daemon running")
+    _apply_stt(bins["meeting-capture"], stt_change, log, todo)
 
     # 6. The one permission macOS will not let us grant
     step("Allow system-audio recording (macOS requires you to do this)")
@@ -488,8 +670,41 @@ def setup(log=print) -> bool:
     return not todo
 
 
+def _transcription() -> dict | None:
+    """Engine state, or None when meeting-capture's agent isn't installed."""
+    if not stt.PLIST.exists():
+        return None
+    try:
+        return stt.current(wait=True)
+    except Exception as e:  # noqa: BLE001 — status must still print
+        return {"ok": False, "label": f"unknown ({type(e).__name__}: {e})", "engine": "?"}
+
+
+def _print_transcription_detail() -> int:
+    print("\n── transcription")
+    t = _transcription()
+    if t is None:
+        print("  ✗ meeting-capture's agent is not installed — run contorch setup")
+        return 1
+    ok = t.get("engine") in ("apple", "gemini")
+    print(f"  {'✓' if ok else '✗'} {t.get('label')}")
+    if not t.get("ok", True):
+        return 1
+    print(f"    setting: {t.get('configured')} · locale: {t.get('locale')} · "
+          f"Gemini key: {'yes' if t.get('has_key') else 'none'}")
+    p = t.get("probe") or {}
+    if p.get("status") != "skipped":
+        print(f"    on-device: {'ready' if p.get('usable') else p.get('reason')}"
+              + (f" ({t['helper']})" if t.get("helper") else ""))
+        if p.get("installed_locales"):
+            print(f"    installed speech models: {', '.join(p['installed_locales'])}")
+    print("    change it: meeting-capture stt auto|apple|gemini · meeting-capture language LOCALE")
+    return 0 if ok else 1
+
+
 def doctor() -> int:
-    rc = _print_status()
+    rc = _print_status(transcription=False)
+    rc = _print_transcription_detail() or rc
     for name in ("meeting-capture", "transcript-watcher"):
         b = shutil.which(name)
         if not b:
@@ -508,7 +723,7 @@ def doctor() -> int:
 
 # ------------------------------------------------------------------ CLI
 
-def _print_status() -> int:
+def _print_status(transcription: bool = True) -> int:
     rows = status()
     if not rows:
         print("No contorch daemons are installed. Run the installer first.")
@@ -523,6 +738,10 @@ def _print_status() -> int:
         else:
             state = "not running"
         print(f"  {r['desc']:<24} {state:<22} {r['label']}")
+    t = _transcription() if transcription else None
+    if t is not None:
+        print(f"\n  {'transcription':<24} {t.get('label')}"
+              + (f"  [setting: {t['setting']}, locale {t['locale']}]" if t.get("setting") else ""))
     return 0
 
 
@@ -531,7 +750,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("setup", help="configure everything after installing (safe to re-run)")
     sub.add_parser("doctor", help="health-check every component")
-    sub.add_parser("status", help="show every contorch daemon and whether it is running")
+    sub.add_parser("status", help="show every contorch daemon, whether it is running, and the transcription engine")
     sub.add_parser("stop", help="stop every contorch daemon and keep them stopped across login")
     sub.add_parser("resume", help="start every contorch daemon again, in order")
     args = p.parse_args(argv)

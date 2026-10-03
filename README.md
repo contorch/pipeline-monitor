@@ -14,7 +14,7 @@ Glanceable state in the menu bar — `○` idle / `● REC` recording / `⚠` so
 
 | Section | Data |
 |---|---|
-| **NOW** | Recording state + current meeting (from the meeting-capture daemon log) |
+| **NOW** | Recording state + current meeting (from the meeting-capture daemon log) · **Transcription:** `on this Mac (en-US)` / `Gemini` / `⚠ unavailable — <reason>` (details: setting, locale, on-device state, key) |
 | **RECENT SESSIONS** | Last 10 transcripts (from the context-orchestrator database; legacy `~/transcripts/*.md` too). Each has **Copy transcript** (whole text to the clipboard) and **Open in TextEdit**. |
 | **INDEX HEALTH** | Chroma doc count + embedding dim · SQLite tasks/sources/insights · last insight age |
 | **MCP / CONNECTIONS** | MCP server activity · last tool call (tool, result, latency, ago) · auto-context hook last fire (ago + latency + chars injected) · expandable timeline of last 20 calls |
@@ -22,6 +22,12 @@ Glanceable state in the menu bar — `○` idle / `● REC` recording / `⚠` so
 | **Actions** | Refresh now · Run end-to-end smoke test · **Start new meeting** (`meeting-capture new` — next speech opens a new transcript) · **Recording settings…** (`meeting-capture ui`: source, USB-interface inputs, live levels) · Open latest transcript/CO dir/MCP log · Restart chroma daemon · capture mode · Stop/Resume everything · Quit |
 
 End-to-end smoke test: inserts a marker doc → searches for it → deletes it. One-click "is the whole stack actually working right now?" check. Reports rank + latency in a notification.
+
+### Transcription engine
+
+meeting-capture transcribes on this Mac (Apple's on-device speech model: macOS 26+ on Apple silicon, no key, audio never leaves the Mac) or with Gemini (optional; needs a key). `meeting-capture stt auto|apple|gemini` and `meeting-capture language LOCALE` set it; `contorch setup` offers Gemini only as an optional upgrade when on-device works, and asks for a key only when it doesn't. `contorch status` and `contorch doctor` show the engine and locale.
+
+The menu bar reads it cheaply and never edits it: the setting and locale come from the meeting-capture agent's plist env (`MEETING_CAPTURE_STT`, `MEETING_CAPTURE_LOCALE`); whether this Mac can do it comes from one `sysaudio transcribe --probe` run on a background thread, cached for 15 minutes per (helper binary, locale) — so a `brew upgrade` or a language change is picked up on the next refresh. The daemon log is not parsed for this. See `pipeline_monitor/transcription.py`.
 
 ## Install
 
@@ -59,7 +65,7 @@ Each collector fails silently if its data source is missing — a half-installed
 
 Python 3.10+, pure stdlib + [`rumps`](https://github.com/jaredks/rumps) (NSStatusItem wrapper) + [`httpx`](https://www.python-httpx.org/) for the chroma daemon heartbeat.
 
-Read-only. Polls every 5s. Each subsystem has its own collector function in `pipeline_monitor/status.py` — independent, fail-silent. The smoke test spawns through context-orchestrator's venv to avoid duplicating chromadb/google-genai deps.
+Read-only. Polls every 5s (the transcription probe runs at most every 15 min, off the main thread). Each subsystem has its own collector function in `pipeline_monitor/status.py` — independent, fail-silent. The smoke test spawns through context-orchestrator's venv to avoid duplicating chromadb/google-genai deps.
 
 ## Why it exists
 

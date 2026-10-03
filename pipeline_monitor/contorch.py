@@ -201,13 +201,77 @@ def _run(cmd: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
+KEY_VARS = ("GOOGLE_API_KEY", "GEMINI_API_KEY")   # meeting-capture's lookup order
+
+
 def _have_key() -> bool:
-    if os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"):
+    """A key in this shell or the key file. Right for things started from the
+    shell; NOT for the recorder, which runs under launchd — see _recorder_key()."""
+    if any(os.environ.get(v) for v in KEY_VARS):
         return True
+    return _key_file_has_key()
+
+
+def _key_file_has_key() -> bool:
     try:
         return KEY_FILE.is_file() and KEY_FILE.read_text().strip() != ""
     except OSError:
         return False
+
+
+def _key_out_of_reach(env: dict) -> tuple[str, str, str] | None:
+    """A Gemini key that exists here but that the recorder will not have once
+    setup is done, as (key, where it is, why the recorder can't use it); None
+    if there is none.
+
+    The recorder is a launchd agent: it never sees this shell's environment
+    (a key exported in ~/.zshrc), and `meeting-capture install`, which setup
+    runs, rewrites the agent's plist env with only PATH and MEETING_CAPTURE_*,
+    so a key put there by hand is dropped too. After setup the key file is the
+    only place it reads a key from."""
+    sources = (
+        (os.environ, "your shell",
+         "it runs in the background under launchd and never sees your shell's environment"),
+        (env, "its launchd plist",
+         "`meeting-capture install`, which setup runs, rewrites that plist without it"),
+    )
+    for source, where, why in sources:
+        for var in KEY_VARS:
+            v = str(source.get(var) or "").strip()
+            if v:
+                return v, f"{var} in {where}", why
+    return None
+
+
+def _recorder_key(env: dict, log) -> bool:
+    """Will the recorder find a Gemini key after setup? The key file, or a key
+    from the shell / plist env that the user agrees to save there."""
+    if _key_file_has_key():
+        log(f"  ✓ Gemini key found ({KEY_FILE})")
+        return True
+    found = _key_out_of_reach(env)
+    if found is None:
+        return False
+    key, where, why = found
+    log(f"  ! The recorder can't use {where}:")
+    log(f"    {why}.")
+    log(f"    It reads its Gemini key from {KEY_FILE}.")
+    if not _interactive():
+        return False
+    ans = input(f"  Save that key to {KEY_FILE} (readable only by you)? [Y/n] ").strip().lower()
+    if ans in ("", "y", "yes"):
+        _write_key(key)
+        log(f"  ✓ saved to {KEY_FILE} (readable only by you)")
+        return True
+    log("  · not saved")
+    return False
+
+
+def _key_todo(env: dict) -> str:
+    """How to give the recorder a key, naming a key it can't see if there is one."""
+    found = _key_out_of_reach(env)
+    note = f" (the recorder can't use {found[1]})" if found else ""
+    return f"write the key to {KEY_FILE} (chmod 600){note}"
 
 
 def _write_key(key: str) -> None:
@@ -346,6 +410,10 @@ def _setup_transcription(log, todo: list, done: list) -> str | None:
     before. The engine setting itself (MEETING_CAPTURE_STT) is meeting-capture's:
     this returns the `meeting-capture stt` value to apply once the recorder is
     installed, or None to leave it as it is.
+
+    "Has a key" means a key the recorder (a launchd agent) will see after
+    setup, i.e. the key file — never this shell's environment. Gemini is only
+    chosen, and only reported as working, when that holds.
     """
     env = stt.plist_env()
     setting = stt.setting_from_env(env)
@@ -359,7 +427,6 @@ def _setup_transcription(log, todo: list, done: list) -> str | None:
             probe = stt.probe(helper, locale)
         else:
             log(f"  ! could not install it: {res['error']}")
-    key = _have_key()
 
     if probe["usable"]:
         loc = probe.get("locale") or locale
@@ -378,19 +445,21 @@ def _setup_transcription(log, todo: list, done: list) -> str | None:
             log(f"    2. Gemini — needs a free API key{'  (default)' if default == '2' else ''}")
             ans = input("  Choose 1-2 (Enter for default): ").strip() or default
             want = "gemini" if ans == "2" else "mac"
-            if want == "gemini" and key:
-                log(f"  ✓ Gemini key found ({'environment' if not KEY_FILE.is_file() else KEY_FILE})")
-            elif want == "gemini":
+        key = False
+        if want == "gemini":
+            key = _recorder_key(env, log)
+            if not key and _interactive() and _key_out_of_reach(env) is None:
                 key = _ask_for_key(log)
-                if not key:
-                    log("  · no key — transcription stays on this Mac")
-                    want = "mac"
+            if not key and _interactive():
+                log("  · no key the recorder can use — transcription stays on this Mac")
+                want = "mac"
         if want == "gemini":
             if not key:
-                # Only reachable non-interactively: already set to Gemini, no key.
-                log("  ✗ transcription is set to Gemini, but there is no Gemini key")
-                todo.append(f"Transcription is set to Gemini but has no key: write one to {KEY_FILE} "
-                            "(chmod 600), or transcribe on this Mac: meeting-capture stt auto")
+                # Only reachable non-interactively: already set to Gemini, no key the
+                # recorder can see. Leave the setting alone and say how to fix it.
+                log("  ✗ transcription is set to Gemini, but the recorder has no Gemini key")
+                todo.append(f"Transcription is set to Gemini but the recorder has no key: {_key_todo(env)}, "
+                            "or transcribe on this Mac: meeting-capture stt auto")
                 return None
             log("  Meeting audio is sent to Google Gemini for transcription; transcripts")
             log("  and the search index stay on this Mac.")
@@ -398,7 +467,7 @@ def _setup_transcription(log, todo: list, done: list) -> str | None:
             return None if setting == "gemini" else "gemini"
         change = "auto" if setting == "gemini" else None
         log("  Transcripts and the search index stay on this Mac too.")
-        if (change or setting) == "auto" and key:
+        if (change or setting) == "auto" and _key_file_has_key():
             log("  (You have a Gemini key, so if on-device speech ever stops working, Gemini")
             log("   takes over; `meeting-capture stt apple` keeps audio on this Mac always.)")
         done.append(f"Transcription on this Mac ({loc})")
@@ -417,17 +486,15 @@ def _setup_transcription(log, todo: list, done: list) -> str | None:
         log(f"  · On-device transcription isn't available here: {reason}")
     log("  Meeting audio is sent to Google Gemini for transcription (this needs a")
     log("  Gemini API key); transcripts and the search index stay on this Mac.")
-    if key:
-        log(f"  ✓ Gemini key found ({'environment' if not KEY_FILE.is_file() else KEY_FILE})")
+    if _recorder_key(env, log):
         done.append("Gemini key")
-    elif _interactive():
-        if _ask_for_key(log):
-            done.append("Gemini key")
-        else:
-            todo.append(f"Add a Gemini key: write it to {KEY_FILE} (chmod 600), then run `contorch setup` again")
-    else:
-        log("  ✗ no key found, and no terminal to ask on — meeting transcription stays off")
-        todo.append(f"Add a Gemini key: write it to {KEY_FILE} (chmod 600), then run `contorch setup` again")
+        return None
+    if _interactive() and _key_out_of_reach(env) is None and _ask_for_key(log):
+        done.append("Gemini key")
+        return None
+    if not _interactive():
+        log("  ✗ no key the recorder can use, and no terminal to ask on — meeting transcription stays off")
+    todo.append(f"Add a Gemini key: {_key_todo(env)}, then run `contorch setup` again")
     return None
 
 

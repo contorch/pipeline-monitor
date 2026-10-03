@@ -139,6 +139,100 @@ exit 1
     assert todo == [] and done == ["Transcription on this Mac (hi-IN)"]
 
 
+# ------------------------------------------------------------ a key only the shell can see
+# The recorder is a launchd agent: it never sees GEMINI_API_KEY / GOOGLE_API_KEY
+# exported in ~/.zshrc, and `meeting-capture install` rewrites its plist env with
+# only PATH and MEETING_CAPTURE_*. After setup the key file is all it can read.
+
+def _daemon_view(monkeypatch, binary, change):
+    """The engine the daemon ends up with: the plist as `meeting-capture stt`
+    would leave it, read without this shell's environment."""
+    write_plist(stt.PLIST, {"MEETING_CAPTURE_SYSAUDIO": str(binary),
+                            **({"MEETING_CAPTURE_STT": change} if change else {})})
+    monkeypatch.setattr(stt, "KEY_FILE", ct.KEY_FILE)
+    for v in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(v, raising=False)
+    stt.clear_cache()
+    return stt.current()
+
+
+def test_shell_only_key_choose_gemini_saves_it_where_the_recorder_reads_it(tmp_path, monkeypatch, env):
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {"MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-in-zshrc")            # exported in the shell only
+    term = Answers(monkeypatch, inputs=["2", ""])                     # Gemini; Enter = save it
+    change, out, todo, done = _run_step()
+    assert "GEMINI_API_KEY in your shell" in out and "launchd" in out
+    assert any("Save that key" in p for p in term.prompts)
+    assert ct.KEY_FILE.read_text() == "AIza-in-zshrc"
+    assert oct(ct.KEY_FILE.stat().st_mode & 0o777) == "0o600"
+    assert term.key_prompts == 0 and ["open", ct.AI_STUDIO] not in env  # no second key asked for
+    assert change == "gemini" and todo == [] and done == ["Transcription with Gemini"]
+    assert _daemon_view(monkeypatch, binary, change)["engine"] == "gemini"
+
+
+def test_shell_only_key_choose_gemini_not_saved_stays_on_device(tmp_path, monkeypatch, env):
+    """The review's repro: before the fix this returned "gemini" with no key the
+    daemon could see, and every chunk was parked untranscribed."""
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {"MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-in-zshrc")
+    term = Answers(monkeypatch, inputs=["2", "n"])
+    change, out, todo, done = _run_step()
+    assert change is None and todo == [] and not ct.KEY_FILE.exists()
+    assert done == ["Transcription on this Mac (en-US)"]
+    assert "Meeting audio is sent to Google" not in out and "stays on this Mac" in out
+    assert term.key_prompts == 0 and ["open", ct.AI_STUDIO] not in env
+    assert _daemon_view(monkeypatch, binary, change)["engine"] == "apple"
+
+
+def test_shell_only_key_is_not_promised_as_the_auto_fallback(tmp_path, monkeypatch, env):
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {"MEETING_CAPTURE_STT": "gemini", "MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIza-in-zshrc")
+    Answers(monkeypatch, inputs=["1"])                               # back to this Mac (auto)
+    change, out, todo, done = _run_step()
+    assert change == "auto" and todo == [] and "takes over" not in out
+    assert not ct.KEY_FILE.exists()
+
+
+def test_shell_only_key_non_interactive_set_to_gemini_is_a_todo(tmp_path, monkeypatch, env):
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {"MEETING_CAPTURE_STT": "gemini", "MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-in-zshrc")
+    monkeypatch.setattr(ct, "_interactive", lambda: False)
+    term = Answers(monkeypatch)
+    change, out, todo, done = _run_step()
+    assert change is None and done == [] and term.prompts == [] and not ct.KEY_FILE.exists()
+    assert len(todo) == 1 and "GEMINI_API_KEY in your shell" in todo[0] and str(ct.KEY_FILE) in todo[0]
+    assert "Transcription with Gemini" not in out
+
+
+def test_key_in_the_plist_env_is_moved_to_the_key_file(tmp_path, monkeypatch, env):
+    # `meeting-capture install` (run by setup) would drop it from the plist.
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {"MEETING_CAPTURE_STT": "gemini", "MEETING_CAPTURE_SYSAUDIO": str(binary),
+                            "GOOGLE_API_KEY": "AIza-in-plist"})
+    term = Answers(monkeypatch, inputs=["", ""])                      # keep Gemini; save it
+    change, out, todo, done = _run_step()
+    assert "The recorder can't use GOOGLE_API_KEY in its launchd plist" in out
+    assert ct.KEY_FILE.read_text() == "AIza-in-plist" and term.key_prompts == 0
+    assert change is None and todo == [] and done == ["Transcription with Gemini"]
+
+
+def test_key_file_wins_over_a_shell_key_without_asking(tmp_path, monkeypatch, env):
+    binary, _ = fake_helper(tmp_path)
+    monkeypatch.setattr(stt, "BREW_HELPERS", (str(binary),))
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-in-zshrc")
+    ct.KEY_FILE.parent.mkdir(parents=True)
+    ct.KEY_FILE.write_text("AIza-file")
+    term = Answers(monkeypatch, inputs=["2"])
+    change, out, todo, done = _run_step()
+    assert change == "gemini" and done == ["Transcription with Gemini"] and todo == []
+    assert ct.KEY_FILE.read_text() == "AIza-file" and len(term.prompts) == 1
+    assert f"Gemini key found ({ct.KEY_FILE})" in out and "your shell" not in out
+
+
 # ------------------------------------------------------------ on-device unavailable
 
 def test_old_sysaudio_falls_back_to_the_key_as_before(tmp_path, monkeypatch, env):
@@ -161,6 +255,41 @@ def test_unavailable_interactive_key_entered(tmp_path, monkeypatch, env):
     change, out, todo, done = _run_step()
     assert change is None and todo == [] and done == ["Gemini key"] and term.key_prompts == 1
     assert "needs Apple silicon" in out and term.prompts == []    # no engine choice to offer
+
+
+def test_unavailable_shell_only_key_is_saved_for_the_recorder(tmp_path, monkeypatch, env):
+    binary, _ = fake_helper(tmp_path, probe_rc=69, probe={"available": False, "reason": "needs Apple silicon"})
+    monkeypatch.setattr(stt, "BREW_HELPERS", (str(binary),))
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIza-in-zshrc")
+    term = Answers(monkeypatch, inputs=["y"])
+    change, out, todo, done = _run_step()
+    assert change is None and todo == [] and done == ["Gemini key"]
+    assert ct.KEY_FILE.read_text() == "AIza-in-zshrc" and term.key_prompts == 0
+    assert "(environment)" not in out
+
+
+def test_unavailable_shell_only_key_non_interactive_is_a_todo(tmp_path, monkeypatch, env):
+    """Before the fix: '✓ Gemini key found (environment)' and done=['Gemini key'],
+    with a daemon that has no key and transcribes nothing."""
+    binary, _ = fake_helper(tmp_path, probe_rc=69, probe={"available": False, "reason": "needs Apple silicon"})
+    monkeypatch.setattr(stt, "BREW_HELPERS", (str(binary),))
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIza-in-zshrc")
+    monkeypatch.setattr(ct, "_interactive", lambda: False)
+    term = Answers(monkeypatch)
+    change, out, todo, done = _run_step()
+    assert change is None and done == [] and term.prompts == [] and not ct.KEY_FILE.exists()
+    assert len(todo) == 1 and todo[0].startswith("Add a Gemini key") and "GOOGLE_API_KEY in your shell" in todo[0]
+
+
+def test_unavailable_shell_only_key_declined_is_a_todo_without_opening_the_browser(tmp_path, monkeypatch, env):
+    binary, _ = fake_helper(tmp_path, probe_rc=69, probe={"available": False, "reason": "needs Apple silicon"})
+    monkeypatch.setattr(stt, "BREW_HELPERS", (str(binary),))
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-in-zshrc")
+    term = Answers(monkeypatch, inputs=["n"])
+    change, out, todo, done = _run_step()
+    assert done == [] and not ct.KEY_FILE.exists() and term.key_prompts == 0
+    assert ["open", ct.AI_STUDIO] not in env
+    assert len(todo) == 1 and "GEMINI_API_KEY in your shell" in todo[0]
 
 
 def test_on_device_only_setting_never_asks_for_a_key(tmp_path, monkeypatch, env):
@@ -223,6 +352,28 @@ def test_setup_applies_gemini_after_installing_the_recorder(tmp_path, monkeypatc
     assert ct.setup(log=lambda *_: None) is True
     mc = [c for c in stack if c[0] == "/x/meeting-capture"]
     assert mc == [["/x/meeting-capture", "install"], ["/x/meeting-capture", "stt", "gemini"]]
+
+
+def test_setup_never_switches_to_gemini_on_a_key_only_the_shell_has(tmp_path, monkeypatch, stack):
+    binary, _ = fake_helper(tmp_path)
+    monkeypatch.setattr(stt, "BREW_HELPERS", (str(binary),))
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-in-zshrc")
+    Answers(monkeypatch, inputs=["2", "n"])                          # Gemini, but don't save the key
+    out: list[str] = []
+    assert ct.setup(log=out.append) is True
+    text = "\n".join(out)
+    assert not any(c[1:2] == ["stt"] for c in stack)                 # stays on this Mac
+    assert "✓ Transcription with Gemini" not in text and "✓ Transcription on this Mac (en-US)" in text
+
+
+def test_setup_saves_a_shell_key_before_switching_to_gemini(tmp_path, monkeypatch, stack):
+    binary, _ = fake_helper(tmp_path)
+    monkeypatch.setattr(stt, "BREW_HELPERS", (str(binary),))
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-in-zshrc")
+    Answers(monkeypatch, inputs=["2", ""])
+    assert ct.setup(log=lambda *_: None) is True
+    assert ct.KEY_FILE.read_text() == "AIza-in-zshrc"
+    assert ["/x/meeting-capture", "stt", "gemini"] in stack
 
 
 def test_setup_without_on_device_and_without_a_key_still_reports_the_todo(tmp_path, monkeypatch, stack):

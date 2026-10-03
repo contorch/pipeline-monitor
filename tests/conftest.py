@@ -4,6 +4,7 @@ helper or read the real plist."""
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import stat
 from pathlib import Path
@@ -19,8 +20,10 @@ def _isolate_transcription(tmp_path, monkeypatch):
     monkeypatch.setattr(stt, "KEY_FILE", tmp_path / "no-key")
     monkeypatch.setattr(stt, "BREW_HELPERS", ())
     monkeypatch.setattr(stt, "_which", lambda name: None)
-    for v in ("MEETING_CAPTURE_TRANSCRIBE_BIN", "MEETING_CAPTURE_SYSAUDIO",
-              "GOOGLE_API_KEY", "GEMINI_API_KEY", "CONTORCH_NONINTERACTIVE"):
+    # Setup reads MEETING_CAPTURE_* from this shell (install carries them into
+    # the plist), so none of the developer's may leak in (e.g. MODE=live).
+    for v in [k for k in os.environ if k.startswith("MEETING_CAPTURE_")] + [
+            "GOOGLE_API_KEY", "GEMINI_API_KEY", "CONTORCH_NONINTERACTIVE"]:
         monkeypatch.delenv(v, raising=False)
     stt.clear_cache()
     yield

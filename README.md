@@ -27,6 +27,8 @@ End-to-end smoke test: inserts a marker doc → searches for it → deletes it. 
 
 meeting-capture transcribes on this Mac (Apple's on-device speech model: macOS 26+ on Apple silicon, no key, audio never leaves the Mac) or with Gemini (optional; needs a key). `meeting-capture stt auto|apple|gemini` and `meeting-capture language LOCALE` set it; `contorch setup` offers Gemini only as an optional upgrade when on-device works, and asks for a key only when it doesn't. `contorch status` and `contorch doctor` show the engine and locale.
 
+Live mode (`meeting-capture mode live`, or the menu's capture-mode toggle) streams every call to Gemini as it happens, whatever the engine — unless the source is line-in, the engine is set to `apple`, or the recorder has no key (meeting-capture's own rule). While it does, the menu bar's Transcription line, Details, `contorch status`/`doctor` add “live: calls stream to Gemini”, and `contorch setup` says so instead of “the audio never leaves this Mac”.
+
 The menu bar reads it cheaply and never edits it: the setting and locale come from the meeting-capture agent's plist env (`MEETING_CAPTURE_STT`, `MEETING_CAPTURE_LOCALE`); whether this Mac can do it comes from one `sysaudio transcribe --probe` run on a background thread, cached for 15 minutes per (helper binary, locale) — so a `brew upgrade` or a language change is picked up on the next refresh. The daemon log is not parsed for this. See `pipeline_monitor/transcription.py`.
 
 ## Install

@@ -302,6 +302,108 @@ def test_on_device_only_setting_never_asks_for_a_key(tmp_path, monkeypatch, env)
     assert todo and "meeting-capture stt auto" in todo[0]
 
 
+# ------------------------------------------------------------ live mode
+# MEETING_CAPTURE_MODE=live streams every call to Gemini unless the source is
+# line-in, stt is apple, or the recorder has no key (meeting-capture's
+# live_mode_blocker). `meeting-capture install` keeps the mode, so setup must
+# not say the audio never leaves this Mac when that is false.
+
+LIVE = {"MEETING_CAPTURE_MODE": "live"}
+
+
+def _key_file(text="AIza-file"):
+    ct.KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ct.KEY_FILE.write_text(text)
+    ct.KEY_FILE.chmod(0o600)
+
+
+@pytest.mark.parametrize("interactive", [False, True])
+def test_live_mode_with_a_key_file_says_calls_stream_to_gemini(tmp_path, monkeypatch, env, interactive):
+    """The review's repro: live mode + stt auto + a key file. Before the fix
+    setup said "the audio never leaves this Mac" and done=['Transcription on
+    this Mac (en-US)'] while the recorder streamed every call to Gemini."""
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {**LIVE, "MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    _key_file()
+    monkeypatch.setattr(ct, "_interactive", lambda: interactive)
+    Answers(monkeypatch, inputs=[""])                                # Enter = on this Mac
+    change, out, todo, done = _run_step()
+    assert change is None and todo == []
+    assert "never leaves this Mac" not in out and "stay on this Mac too" not in out
+    assert "Live mode is on: calls stream to Google Gemini as they happen" in out
+    assert ct.LIVE_KEEP_LOCAL in out
+    assert done == ["Live mode: calls stream to Google Gemini"]
+    if interactive:                                                   # said before the choice, too
+        assert out.index("live mode is on") < out.index("1. On this Mac")
+    assert _daemon_view(monkeypatch, binary, change)["engine"] == "apple"
+    write_plist(stt.PLIST, {**LIVE, "MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    stt.clear_cache()
+    assert stt.current()["label"] == "on this Mac (en-US) · live: calls stream to Gemini"
+
+
+def test_live_mode_going_back_from_gemini_to_auto_still_streams(tmp_path, monkeypatch, env):
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {**LIVE, "MEETING_CAPTURE_STT": "gemini", "MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    _key_file()
+    Answers(monkeypatch, inputs=["1"])
+    change, out, todo, done = _run_step()
+    assert change == "auto" and done == ["Live mode: calls stream to Google Gemini"]
+    assert "never leaves" not in out and "takes over" not in out
+
+
+def test_live_mode_choosing_gemini_says_it_streams(tmp_path, monkeypatch, env):
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {**LIVE, "MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    _key_file()
+    Answers(monkeypatch, inputs=["2"])
+    change, out, todo, done = _run_step()
+    assert change == "gemini" and todo == []
+    assert "Meeting audio is sent to Google Gemini" in out and "Live mode is on" in out
+    assert done == ["Transcription with Gemini (live mode: calls stream as they happen)"]
+
+
+def test_live_mode_exported_in_the_shell_is_kept_by_install(tmp_path, monkeypatch, env):
+    # `meeting-capture install` copies MEETING_CAPTURE_* from setup's environment.
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {"MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    monkeypatch.setenv("MEETING_CAPTURE_MODE", "live")
+    _key_file()
+    monkeypatch.setattr(ct, "_interactive", lambda: False)
+    change, out, todo, done = _run_step()
+    assert "never leaves" not in out and done == ["Live mode: calls stream to Google Gemini"]
+
+
+@pytest.mark.parametrize("plist_extra,key_file,why", [
+    # A key only in the plist env: install drops it, so live can't connect.
+    ({"GOOGLE_API_KEY": "AIza-in-plist"}, False, "no Google API key"),
+    ({}, False, "no Google API key"),
+    ({"MEETING_CAPTURE_STT": "apple"}, True, "never uploads"),
+    ({"MEETING_CAPTURE_SOURCE": "linein"}, True, "line-in"),
+])
+def test_live_mode_that_will_run_batch_keeps_the_audio_here(tmp_path, monkeypatch, env, plist_extra, key_file, why):
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {**LIVE, "MEETING_CAPTURE_SYSAUDIO": str(binary), **plist_extra})
+    if key_file:
+        _key_file()
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-in-zshrc")            # the recorder never sees it
+    monkeypatch.setattr(ct, "_interactive", lambda: False)
+    change, out, todo, done = _run_step()
+    assert "No API key needed, and the audio never leaves this Mac." in out
+    assert "Live mode is on" not in out
+    assert "Live mode is requested, but the recorder records in batch" in out and why in out
+    assert done == ["Transcription on this Mac (en-US)"] and todo == []
+
+
+def test_live_mode_without_on_device_mentions_the_stream(tmp_path, monkeypatch, env):
+    binary, _ = fake_helper(tmp_path, probe_rc=69, probe={"available": False, "reason": "needs Apple silicon"})
+    write_plist(stt.PLIST, {**LIVE, "MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    _key_file()
+    monkeypatch.setattr(ct, "_interactive", lambda: False)
+    change, out, todo, done = _run_step()
+    assert done == ["Gemini key"] and "Live mode is on: calls stream to Google Gemini" in out
+    assert ct.LIVE_KEEP_LOCAL not in out                              # nothing local to fall back to
+
+
 def test_apply_stt_goes_through_meeting_capture(env):
     todo, log = [], []
     ct._apply_stt("/x/meeting-capture", None, log.append, todo)
@@ -343,6 +445,19 @@ def test_setup_succeeds_without_a_key_when_this_mac_transcribes(tmp_path, monkey
     assert "✓ Transcription on this Mac (en-US)" in text
     assert ["/x/meeting-capture", "install"] in stack
     assert not any(c[1:2] == ["stt"] for c in stack)                 # the default needs no change
+
+
+def test_setup_in_live_mode_reports_the_stream_in_the_summary(tmp_path, monkeypatch, stack):
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {**LIVE, "MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    _key_file()
+    Answers(monkeypatch)
+    out: list[str] = []
+    assert ct.setup(log=out.append) is True
+    text = "\n".join(out)
+    assert "never leaves this Mac" not in text
+    assert "✓ Live mode: calls stream to Google Gemini" in text
+    assert "✓ Transcription on this Mac" not in text
 
 
 def test_setup_applies_gemini_after_installing_the_recorder(tmp_path, monkeypatch, stack):
@@ -408,3 +523,33 @@ def test_status_and_doctor_show_the_engine(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "── transcription" in out and "✗ unavailable — set to Gemini, but there is no Gemini API key" in out
     assert rc == 1
+
+
+def test_status_and_doctor_say_live_mode_streams(tmp_path, monkeypatch, capsys):
+    """The review's repro for status/doctor: live + stt auto + key file printed
+    "✓ on this Mac (en-US)" with no word about the stream."""
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    (agents / "com.contorch.meeting-capture.plist").write_text("")
+    monkeypatch.setattr(ct, "LAUNCH_AGENTS", agents)
+    monkeypatch.setattr(ct, "STOPPED_MARKER", tmp_path / "stopped.json")
+    monkeypatch.setattr(ct, "_launchctl", lambda *a: subprocess.CompletedProcess(a, 0, "", ""))
+    monkeypatch.setattr(ct.shutil, "which", lambda n: None)
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {"MEETING_CAPTURE_MODE": "live", "MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    stt.KEY_FILE.write_text("AIza-test")
+    assert ct.main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "on this Mac (en-US) · live: calls stream to Gemini" in out
+    ct.doctor()
+    out = capsys.readouterr().out
+    assert "✓ on this Mac (en-US) · live: calls stream to Gemini" in out
+    assert "live mode: on — every call streams to Gemini" in out
+
+    write_plist(stt.PLIST, {"MEETING_CAPTURE_MODE": "live", "MEETING_CAPTURE_STT": "apple",
+                            "MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    stt.clear_cache()
+    ct.doctor()
+    out = capsys.readouterr().out
+    assert "✓ on this Mac (en-US)\n" in out and "stream" not in out.split("── transcription")[1].split("change it")[0]
+    assert f"live mode: requested, but {stt.LIVE_NEVER_UPLOADS} — running batch" in out

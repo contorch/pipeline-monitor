@@ -184,7 +184,8 @@ def _build_status_line(snap: st.Snapshot) -> rumps.MenuItem:
 
 
 def _build_transcription_line(snap: st.Snapshot) -> rumps.MenuItem | None:
-    """'Transcription: on this Mac (en-US)' / 'Gemini' / '⚠ … unavailable — why'.
+    """'Transcription: on this Mac (en-US)' / 'Gemini' / '⚠ … unavailable — why',
+    with ' · live: calls stream to Gemini' while live mode uploads every call.
     None when meeting-capture isn't installed (the status line says so)."""
     t = snap.transcription or {}
     if not t.get("ok"):
@@ -196,7 +197,7 @@ def _build_transcription_line(snap: st.Snapshot) -> rumps.MenuItem | None:
 
 
 def _transcription_details(snap: st.Snapshot) -> list[str]:
-    """Details-submenu lines: the setting, on-device state, key."""
+    """Details-submenu lines: the setting, on-device state, key, live mode."""
     t = snap.transcription or {}
     if not t.get("ok"):
         return [f"Transcription: {_truncate(t['error'], 60)}"] if t.get("error") else []
@@ -207,6 +208,11 @@ def _transcription_details(snap: st.Snapshot) -> list[str]:
         on_device = "ready" if p.get("usable") else _truncate(p.get("reason") or p.get("status"), 60)
         lines.append(f"  on-device: {on_device}")
     lines.append(f"  Gemini key: {'yes' if t.get('has_key') else 'none'}")
+    live = t.get("live") or {}
+    if live.get("streaming"):
+        lines.append("  live mode: on — every call streams to Gemini (uploaded)")
+    elif live.get("requested"):
+        lines.append(f"  live mode: runs batch — {_truncate(live.get('blocker') or '?', 60)}")
     return lines
 
 

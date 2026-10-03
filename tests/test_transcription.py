@@ -231,3 +231,73 @@ def test_missing_model_says_how_to_install_it():
     r = stt.resolve("apple", "hi-IN", p, False)
     assert r["engine"] == "none" and "meeting-capture language hi-IN" in r["reason"]
     assert stt.resolve("auto", "hi-IN", p, True)["engine"] == "gemini"
+
+
+# ------------------------------------------------------------ live mode
+# meeting-capture's cli.live_mode_blocker(): live mode streams every call to
+# Gemini unless the source is line-in, stt is apple, or there is no key.
+
+LIVE = {"MEETING_CAPTURE_MODE": "live"}
+
+
+@pytest.mark.parametrize("env,key,blocker", [
+    ({}, True, None),                                                    # stt auto streams too
+    ({"MEETING_CAPTURE_STT": "gemini"}, True, None),
+    ({"MEETING_CAPTURE_STT": "apple"}, True, stt.LIVE_NEVER_UPLOADS),
+    ({}, False, stt.LIVE_NEEDS_KEY),
+    ({"MEETING_CAPTURE_SOURCE": "linein"}, True, stt.LIVE_LINEIN),
+    ({"MEETING_CAPTURE_SOURCE": "linein", "MEETING_CAPTURE_STT": "apple"}, False, stt.LIVE_LINEIN),
+])
+def test_live_blocker_mirrors_meeting_capture(env, key, blocker):
+    assert stt.live_blocker({**LIVE, **env}, key) == blocker
+    state = stt.live_state({**LIVE, **env}, key)
+    assert state == {"requested": True, "streaming": blocker is None, "blocker": blocker}
+
+
+@pytest.mark.parametrize("mode", [None, "batch", "", "LIVEISH"])
+def test_live_not_requested(mode):
+    env = {} if mode is None else {"MEETING_CAPTURE_MODE": mode}
+    assert stt.live_state(env, True) == {"requested": False, "streaming": False, "blocker": None}
+    assert stt.live_requested({"MEETING_CAPTURE_MODE": " Live "})
+
+
+def test_current_live_mode_with_a_key_file_says_calls_stream_to_gemini(tmp_path):
+    """The review's repro: live mode, stt auto, a key file. Before the fix the
+    menu, status and doctor said "on this Mac (en-US)" while every call was
+    streamed to Gemini."""
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {**LIVE, "MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    stt.KEY_FILE.write_text("AIza-test")
+    stt.KEY_FILE.chmod(0o600)
+    t = stt.current()
+    assert t["engine"] == "apple"                                       # batch engine is unchanged
+    assert t["live"] == {"requested": True, "streaming": True, "blocker": None}
+    assert t["label"] == "on this Mac (en-US) · live: calls stream to Gemini"
+
+
+def test_current_live_mode_key_in_the_plist_env_counts_for_the_running_recorder(tmp_path):
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {**LIVE, "MEETING_CAPTURE_SYSAUDIO": str(binary), "GEMINI_API_KEY": "AIza-x"})
+    assert stt.current()["live"]["streaming"]
+
+
+@pytest.mark.parametrize("extra,blocker", [
+    ({}, stt.LIVE_NEEDS_KEY),                                            # no key anywhere
+    ({"MEETING_CAPTURE_STT": "apple"}, stt.LIVE_NEVER_UPLOADS),
+    ({"MEETING_CAPTURE_SOURCE": "linein"}, stt.LIVE_LINEIN),
+])
+def test_current_live_mode_that_runs_batch_keeps_the_plain_label(tmp_path, monkeypatch, extra, blocker):
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {**LIVE, "MEETING_CAPTURE_SYSAUDIO": str(binary), **extra})
+    if extra:
+        stt.KEY_FILE.write_text("AIza-test")
+    monkeypatch.setenv("GOOGLE_API_KEY", "shell-only")                  # the recorder never sees it
+    t = stt.current()
+    assert t["live"] == {"requested": True, "streaming": False, "blocker": blocker}
+    assert t["label"] == "on this Mac (en-US)"
+
+
+def test_current_live_mode_with_gemini_engine(tmp_path):
+    write_plist(stt.PLIST, {**LIVE, "MEETING_CAPTURE_STT": "gemini"})
+    stt.KEY_FILE.write_text("AIza-test")
+    assert stt.current()["label"] == "Gemini · live: calls stream to Gemini"

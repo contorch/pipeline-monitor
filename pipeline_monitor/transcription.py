@@ -15,6 +15,14 @@ of com.contorch.meeting-capture, written only by meeting-capture itself
     apple  = on this Mac only; never uploads (audio is kept and retried).
     gemini = Gemini (needs a key).
 
+Live mode (MEETING_CAPTURE_MODE=live, the menu's capture-mode toggle) is a
+separate switch: it streams every call to Gemini as it happens, whatever the
+engine above picks (that engine then only transcribes parked audio). It runs
+unless the source is line-in, the setting is apple, or the recorder has no
+key — meeting-capture's `cli.live_mode_blocker()` / `live.live_blocker()`,
+mirrored by live_blocker() here so the menu, status, doctor and setup never
+say "on this Mac" while calls are being uploaded.
+
 Whether the Mac can do it comes from the helper's own probe (stable JSON
 contract, shared with meeting-capture):
 
@@ -60,6 +68,15 @@ LOCALE_ENV = "MEETING_CAPTURE_LOCALE"
 LEGACY_ENV = "MEETING_CAPTURE_TRANSCRIBER"
 BIN_ENV = "MEETING_CAPTURE_TRANSCRIBE_BIN"   # dev/testing override (contract)
 SYSAUDIO_ENV = "MEETING_CAPTURE_SYSAUDIO"
+MODE_ENV = "MEETING_CAPTURE_MODE"             # batch (default) | live
+SOURCE_ENV = "MEETING_CAPTURE_SOURCE"         # sck (default) | linein
+
+# Why live mode runs batch instead — meeting-capture's own wording
+# (cli.LINEIN_IS_BATCH, live.LIVE_NEVER_UPLOADS, live.LIVE_NEEDS_KEY).
+LIVE_LINEIN = "the audio source is line-in, which always records in batch"
+LIVE_NEVER_UPLOADS = "transcription is set to on this Mac only (stt apple), which never uploads"
+LIVE_NEEDS_KEY = "live mode streams to Gemini and no Google API key is set"
+LIVE_LABEL = "live: calls stream to Gemini"
 
 SETTINGS = ("auto", "apple", "gemini")
 DEFAULT_SETTING = "auto"
@@ -120,6 +137,35 @@ def has_gemini_key(env: dict, key_file: Path | None = None) -> bool:
         return f.is_file() and f.read_text(encoding="utf-8").strip() != ""
     except OSError:
         return False
+
+
+def live_requested(env: dict) -> bool:
+    """Is the recorder asked for live mode (MEETING_CAPTURE_MODE=live)?"""
+    return str(env.get(MODE_ENV, "")).strip().lower() == "live"
+
+
+def live_blocker(env: dict, has_key: bool) -> str | None:
+    """Why live mode, if asked for, runs batch instead; None when it streams
+    calls to Gemini. meeting-capture's rule (cli.live_mode_blocker): line-in
+    always records batch; stt=apple never uploads; no key cannot connect.
+    stt=auto streams even when batch would transcribe on this Mac — live mode
+    is the user's explicit choice to stream. `has_key` is has_gemini_key(env)
+    for the running recorder (setup passes what it will have after install)."""
+    if str(env.get(SOURCE_ENV, "")).strip().lower() == "linein":
+        return LIVE_LINEIN
+    if setting_from_env(env) == "apple":
+        return LIVE_NEVER_UPLOADS
+    if not has_key:
+        return LIVE_NEEDS_KEY
+    return None
+
+
+def live_state(env: dict, has_key: bool) -> dict[str, Any]:
+    """{"requested", "streaming", "blocker"}: streaming = every call is
+    uploaded to Gemini as it happens, whatever the batch engine is."""
+    requested = live_requested(env)
+    blocker = live_blocker(env, has_key) if requested else None
+    return {"requested": requested, "streaming": requested and blocker is None, "blocker": blocker}
 
 
 def _which(name: str) -> str | None:
@@ -341,21 +387,27 @@ def resolve(setting: str, locale: str, probe_result: dict, has_key: bool) -> dic
 
 
 def label(state: dict) -> str:
-    """'on this Mac (en-US)' / 'Gemini' / 'unavailable — <reason>' / 'checking…'."""
+    """'on this Mac (en-US)' / 'Gemini' / 'unavailable — <reason>' / 'checking…',
+    plus ' · live: calls stream to Gemini' while live mode uploads every call."""
     engine = state.get("engine")
     if engine == "apple":
         loc = (state.get("probe") or {}).get("locale") or state.get("locale") or DEFAULT_LOCALE
-        return f"on this Mac ({loc})"
-    if engine == "gemini":
-        return "Gemini"
-    if engine == "checking":
-        return "checking…"
-    return f"unavailable — {state.get('reason') or 'unknown'}"
+        text = f"on this Mac ({loc})"
+    elif engine == "gemini":
+        text = "Gemini"
+    elif engine == "checking":
+        text = "checking…"
+    else:
+        text = f"unavailable — {state.get('reason') or 'unknown'}"
+    if (state.get("live") or {}).get("streaming"):
+        text += f" · {LIVE_LABEL}"
+    return text
 
 
 def current(wait: bool = True, ttl: float = PROBE_TTL_S, env: dict | None = None,
             plist: Path | None = None) -> dict[str, Any]:
-    """Everything the menu bar / doctor show about transcription.
+    """Everything the menu bar / doctor show about transcription, including
+    whether live mode streams calls to Gemini ("live").
     The helper is probed only when the setting can use it (auto / apple)."""
     plist = Path(plist or PLIST)
     env = plist_env(plist) if env is None else env
@@ -378,6 +430,7 @@ def current(wait: bool = True, ttl: float = PROBE_TTL_S, env: dict | None = None
         "has_key": key,
         "helper": helper,
         "probe": p,
+        "live": live_state(env, key),
         **state,
     }
     out["label"] = label(out)

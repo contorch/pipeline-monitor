@@ -191,3 +191,24 @@ def test_menu_details_show_setting_locale_and_on_device_state():
     assert lines[-1].strip() == "Gemini key: yes"
     titles = [i.title for i in app._build_details_submenu(snap).values() if hasattr(i, "title")]
     assert "Transcription: Gemini" in titles
+
+
+def test_menu_says_live_mode_streams(tmp_path):
+    """Menu bar Transcription line and Details, from the real transcription
+    state: live mode + stt auto + a key file streams every call to Gemini."""
+    import pipeline_monitor.app as app
+    from conftest import fake_helper, write_plist
+    from pipeline_monitor import transcription as stt
+    binary, _ = fake_helper(tmp_path)
+    write_plist(stt.PLIST, {"MEETING_CAPTURE_MODE": "live", "MEETING_CAPTURE_SYSAUDIO": str(binary)})
+    stt.KEY_FILE.write_text("AIza-test")
+    snap = app.st.Snapshot(transcription=app.st.transcription_status(wait=True))
+    assert app._build_transcription_line(snap).title == \
+        "Transcription: on this Mac (en-US) · live: calls stream to Gemini"
+    lines = app._transcription_details(snap)
+    assert lines[0] == "Transcription: on this Mac (en-US) · live: calls stream to Gemini"
+    assert lines[-1].strip() == "live mode: on — every call streams to Gemini (uploaded)"
+    stt.KEY_FILE.unlink()                                       # no key: live can't connect, runs batch
+    snap = app.st.Snapshot(transcription=app.st.transcription_status(wait=True))
+    assert app._build_transcription_line(snap).title == "Transcription: on this Mac (en-US)"
+    assert app._transcription_details(snap)[-1].strip().startswith("live mode: runs batch — live mode streams")

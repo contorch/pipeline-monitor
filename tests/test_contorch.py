@@ -156,3 +156,38 @@ def test_recent_sessions_each_have_copy_and_open(monkeypatch):
     menu = app._build_recent_submenu(snap)
     (item,) = list(menu.values())
     assert [i.title for i in item.values()] == ["Copy transcript", "Open in TextEdit"]
+
+
+# ------------------------------------------------------------ menu bar: transcription
+
+@pytest.mark.parametrize("t,title", [
+    ({"ok": True, "engine": "apple", "label": "on this Mac (en-US)"}, "Transcription: on this Mac (en-US)"),
+    ({"ok": True, "engine": "gemini", "label": "Gemini"}, "Transcription: Gemini"),
+    ({"ok": True, "engine": "checking", "label": "checking…"}, "Transcription: checking…"),
+    ({"ok": True, "engine": "none", "label": "unavailable — needs macOS 26 or later, and there is no Gemini API key"},
+     "⚠ Transcription: unavailable — needs macOS 26 or later, and there is no Gemini API key"),
+])
+def test_menu_transcription_line(t, title):
+    import pipeline_monitor.app as app
+    assert app._build_transcription_line(app.st.Snapshot(transcription=t)).title == title
+
+
+def test_menu_transcription_line_hidden_without_meeting_capture():
+    import pipeline_monitor.app as app
+    snap = app.st.Snapshot(transcription={"ok": False, "error": "meeting-capture launchd agent not installed"})
+    assert app._build_transcription_line(snap) is None
+
+
+def test_menu_details_show_setting_locale_and_on_device_state():
+    import pipeline_monitor.app as app
+    snap = app.st.Snapshot(transcription={
+        "ok": True, "engine": "gemini", "label": "Gemini", "setting": "auto", "locale": "en-US",
+        "has_key": True, "probe": {"status": "old_helper", "usable": False,
+                                   "reason": "this sysaudio predates on-device transcription"}})
+    lines = app._transcription_details(snap)
+    assert lines[0] == "Transcription: Gemini"
+    assert "setting: auto · locale en-US" in lines[1]
+    assert any(l.strip().startswith("on-device: this sysaudio predates") for l in lines)
+    assert lines[-1].strip() == "Gemini key: yes"
+    titles = [i.title for i in app._build_details_submenu(snap).values() if hasattr(i, "title")]
+    assert "Transcription: Gemini" in titles

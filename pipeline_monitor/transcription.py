@@ -1,57 +1,54 @@
-"""Which speech-to-text engine meeting-capture transcribes with, read cheaply.
+"""How meetings are transcribed: asked from meeting-capture, never re-derived.
 
-meeting-capture (>= 0.7) can transcribe on this Mac with Apple's on-device
-speech model (SpeechTranscriber: macOS 26+, Apple silicon) through its signed
-`sysaudio` helper, or with Gemini. Its settings live in the launchd plist env
-of com.contorch.meeting-capture, written only by meeting-capture itself
-(`meeting-capture stt auto|apple|gemini`, `meeting-capture language LOCALE`):
+meeting-capture owns every rule here: which engine runs (on this Mac with
+Apple's on-device speech, Gemini, or nothing yet), the language (it follows the
+Mac), whether live mode streams calls to Gemini, which Gemini key its launchd
+recorder can see, and how to fix what is missing. It answers with
 
-    MEETING_CAPTURE_STT     auto (default) | apple | gemini
-    MEETING_CAPTURE_LOCALE  default en-US
-    MEETING_CAPTURE_TRANSCRIBER=gemini|whisper (legacy) counts as auto
+    meeting-capture stt --json
 
-    auto   = on this Mac when the helper's probe says it is usable now (model
-             installed), else Gemini when a key resolves, else unavailable.
-    apple  = on this Mac only; never uploads (audio is kept and retried).
-    gemini = Gemini (needs a key).
+one JSON object on stdout, schema 1. The fields are listed under "Contract" in
+meeting-capture's README and in this repo's; change both sides together. This
+module only reads that answer, for the menu bar and `contorch
+setup|status|doctor`. It used to re-implement the rules and drifted: it kept
+assuming en-US after meeting-capture's language started following the Mac, and
+promised "audio never leaves this Mac" on a Dutch Mac where meeting-capture
+picks Gemini.
 
-Live mode (MEETING_CAPTURE_MODE=live, the menu's capture-mode toggle) is a
-separate switch: it streams every call to Gemini as it happens, whatever the
-engine above picks (that engine then only transcribes parked audio). It runs
-unless the source is line-in, the setting is apple, or the recorder has no
-key — meeting-capture's `cli.live_mode_blocker()` / `live.live_blocker()`,
-mirrored by live_blocker() here so the menu, status, doctor and setup never
-say "on this Mac" while calls are being uploaded.
+  * find_meeting_capture(): the Homebrew opt/ path (Apple silicon, then
+    Intel), then PATH, then the per-user venv of a source install.
+  * read(): runs it once, with a timeout. The result is one of
+      ok       the JSON
+      old      meeting-capture < 0.7: no `stt --json`, so a usage error
+               (exit 2). It transcribes with Gemini only, so the result is
+               never "on this Mac".
+      error    it failed, timed out, printed something unparsable, or used
+               a schema this contorch doesn't know. The result is unknown:
+               never "on this Mac", and no privacy claim.
+      missing  meeting-capture isn't installed.
+  * current(wait): read() cached per (plist mtime, the meeting-capture
+    executable's resolved path + mtime + size, the key file's mtime or
+    absence). A `meeting-capture stt|language|mode` change rewrites the plist
+    and a `brew upgrade` replaces the executable, so both show up on the next
+    refresh. Otherwise an answer lasts TTL_S (10 min; the Mac's language can
+    change too) and an error RETRY_S (60 s). With wait=False (the menu bar's
+    5-second timer) a stale answer is refreshed on a background thread.
+    "checking" is returned until the first answer arrives, so the menu never
+    waits on a subprocess.
+  * privacy(): the only place that says where audio goes. It uses nothing
+    but the JSON's "uploads" and "live.active".
 
-Whether the Mac can do it comes from the helper's own probe (stable JSON
-contract, shared with meeting-capture):
+The reads go through the brew wrapper, which builds meeting-capture's venv the
+first time it runs after an install or a `brew upgrade` (a pip install, which
+takes time). For that reason the timeouts are generous.
 
-    sysaudio transcribe --probe --locale L
-      -> one JSON line {"available", "reason", "os", "arch", "locale",
-         "installed", "supported", "installed_locales"}
-      exit 0 usable now · 69 unusable (macOS < 26, Intel, locale unsupported)
-      · 75 supported but the model is not installed.
-    Older sysaudio builds print "unknown arg: transcribe" and exit non-zero:
-    that means unavailable.
-
-How this is read (pipeline-monitor never edits the plist):
-  * setting, locale: the plist env (a file read; same as the capture mode).
-  * on-device availability: one probe of the helper, cached per
-    (helper path, its mtime + size, locale) for PROBE_TTL_S. Upgrading
-    meeting-capture (new helper binary) or `meeting-capture language` (new
-    locale) changes the cache key, so those show up on the next refresh; the
-    menu bar never runs the helper on its 5-second timer otherwise, and runs
-    it off the main thread (`wait=False`) so a slow probe cannot freeze the
-    menu. The daemon's log is NOT parsed for this.
-  * Gemini key: what the daemon would see — GOOGLE_API_KEY/GEMINI_API_KEY in
-    its plist env, else ~/.config/google/key.
-
-Stdlib only: `contorch` (setup/doctor/status) and the menu bar share it.
+Stdlib only: the menu bar and the `contorch` CLI share it.
 """
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import threading
@@ -63,233 +60,104 @@ HOME = Path.home()
 PLIST = HOME / "Library" / "LaunchAgents" / "com.contorch.meeting-capture.plist"
 KEY_FILE = HOME / ".config" / "google" / "key"
 
-STT_ENV = "MEETING_CAPTURE_STT"
-LOCALE_ENV = "MEETING_CAPTURE_LOCALE"
-LEGACY_ENV = "MEETING_CAPTURE_TRANSCRIBER"
-BIN_ENV = "MEETING_CAPTURE_TRANSCRIBE_BIN"   # dev/testing override (contract)
-SYSAUDIO_ENV = "MEETING_CAPTURE_SYSAUDIO"
-MODE_ENV = "MEETING_CAPTURE_MODE"             # batch (default) | live
-SOURCE_ENV = "MEETING_CAPTURE_SOURCE"         # sck (default) | linein
-
-# Why live mode runs batch instead — meeting-capture's own wording
-# (cli.LINEIN_IS_BATCH, live.LIVE_NEVER_UPLOADS, live.LIVE_NEEDS_KEY).
-LIVE_LINEIN = "the audio source is line-in, which always records in batch"
-LIVE_NEVER_UPLOADS = "transcription is set to on this Mac only (stt apple), which never uploads"
-LIVE_NEEDS_KEY = "live mode streams to Gemini and no Google API key is set"
-LIVE_LABEL = "live: calls stream to Gemini"
-
-SETTINGS = ("auto", "apple", "gemini")
-DEFAULT_SETTING = "auto"
-DEFAULT_LOCALE = "en-US"
-
-# sysexits(3), as the helper uses them.
-EX_UNAVAILABLE = 69
-EX_SOFTWARE = 70
-EX_TEMPFAIL = 75
-
-# Where Homebrew puts the helper; the stable opt/ path is the one the
-# Screen Recording grant and the plist use.
-BREW_HELPERS = (
-    "/opt/homebrew/opt/meeting-capture/bin/sysaudio",
-    "/usr/local/opt/meeting-capture/bin/sysaudio",
+# Where `brew install contorch/tap/contorch` puts the CLI: the stable opt/
+# path. launchd gives the menu bar no shell PATH.
+MC_CANDIDATES = (
+    "/opt/homebrew/opt/meeting-capture/bin/meeting-capture",
+    "/usr/local/opt/meeting-capture/bin/meeting-capture",
 )
+MC_VENV = HOME / ".meeting-capture" / "venv" / "bin" / "meeting-capture"
 
-PROBE_TIMEOUT_S = 20.0
-PROBE_TTL_S = 15 * 60       # a definitive answer (ready / unavailable / needs model)
-PROBE_RETRY_S = 60          # a probe that failed or timed out: try again soon
-INSTALL_TIMEOUT_S = 900     # a new language family can be a ~250 MB download
+SCHEMA = 1                    # the `meeting-capture stt --json` schema this module reads
+# Normally ~0.2 s, and meeting-capture bounds its own helper probe (20 s). The
+# long tail is the brew wrapper building meeting-capture's venv on its first
+# run after an install or upgrade: a timeout must not kill that pip install.
+READ_TIMEOUT_S = 300.0        # contorch status / doctor / setup
+BACKGROUND_TIMEOUT_S = 600.0  # the menu bar's read, on its own thread
+TTL_S = 600.0
+RETRY_S = 60.0
 
-OLD_HELPER_REASON = "this sysaudio predates on-device transcription — upgrade meeting-capture"
-NO_HELPER_REASON = "sysaudio not found — install meeting-capture"
-
-
-# ------------------------------------------------------------------ config
-
-def plist_env(plist: Path | None = None) -> dict:
-    """EnvironmentVariables of the meeting-capture launchd agent ({} if none)."""
-    import plistlib
-    try:
-        payload = plistlib.loads(Path(plist or PLIST).read_bytes())
-        env = payload.get("EnvironmentVariables") or {}
-        return {str(k): str(v) for k, v in env.items()}
-    except Exception:
-        return {}
+OLD_LABEL = "Gemini (meeting-capture < 0.7 — upgrade for on-device)"
+LIVE_LABEL = "live: calls stream to Gemini"
+ENGINES = ("apple", "gemini", "none")
 
 
-def setting_from_env(env: dict) -> str:
-    """auto | apple | gemini. Unset, unknown, or only the legacy
-    MEETING_CAPTURE_TRANSCRIBER (gemini|whisper) → auto."""
-    raw = str(env.get(STT_ENV, "")).strip().lower()
-    return raw if raw in SETTINGS else DEFAULT_SETTING
-
-
-def locale_from_env(env: dict) -> str:
-    return str(env.get(LOCALE_ENV, "")).strip() or DEFAULT_LOCALE
-
-
-def has_gemini_key(env: dict, key_file: Path | None = None) -> bool:
-    """Would the daemon find a Gemini key? Its own environment (the plist
-    env), then the key file — the same order meeting-capture resolves it."""
-    if str(env.get("GOOGLE_API_KEY", "")).strip() or str(env.get("GEMINI_API_KEY", "")).strip():
-        return True
-    try:
-        f = Path(key_file or KEY_FILE)
-        return f.is_file() and f.read_text(encoding="utf-8").strip() != ""
-    except OSError:
-        return False
-
-
-def live_requested(env: dict) -> bool:
-    """Is the recorder asked for live mode (MEETING_CAPTURE_MODE=live)?"""
-    return str(env.get(MODE_ENV, "")).strip().lower() == "live"
-
-
-def live_blocker(env: dict, has_key: bool) -> str | None:
-    """Why live mode, if asked for, runs batch instead; None when it streams
-    calls to Gemini. meeting-capture's rule (cli.live_mode_blocker): line-in
-    always records batch; stt=apple never uploads; no key cannot connect.
-    stt=auto streams even when batch would transcribe on this Mac — live mode
-    is the user's explicit choice to stream. `has_key` is has_gemini_key(env)
-    for the running recorder (setup passes what it will have after install)."""
-    if str(env.get(SOURCE_ENV, "")).strip().lower() == "linein":
-        return LIVE_LINEIN
-    if setting_from_env(env) == "apple":
-        return LIVE_NEVER_UPLOADS
-    if not has_key:
-        return LIVE_NEEDS_KEY
-    return None
-
-
-def live_state(env: dict, has_key: bool) -> dict[str, Any]:
-    """{"requested", "streaming", "blocker"}: streaming = every call is
-    uploaded to Gemini as it happens, whatever the batch engine is."""
-    requested = live_requested(env)
-    blocker = live_blocker(env, has_key) if requested else None
-    return {"requested": requested, "streaming": requested and blocker is None, "blocker": blocker}
-
+# ------------------------------------------------------------------ locate + read
 
 def _which(name: str) -> str | None:
     return shutil.which(name)
 
 
-def find_helper(env: dict | None = None) -> str | None:
-    """The `sysaudio` that does `transcribe`, in the order meeting-capture
-    resolves it: MEETING_CAPTURE_TRANSCRIBE_BIN (this process, then the
-    daemon's plist env), then the sysaudio the daemon is pinned to
-    (MEETING_CAPTURE_SYSAUDIO in the plist), then this environment's
-    MEETING_CAPTURE_SYSAUDIO, the Homebrew opt/ path, and PATH."""
-    env = plist_env() if env is None else env
-    candidates = [
-        os.environ.get(BIN_ENV),
-        env.get(BIN_ENV),
-        env.get(SYSAUDIO_ENV),
-        os.environ.get(SYSAUDIO_ENV),
-        *BREW_HELPERS,
-        _which("sysaudio"),
-    ]
-    for c in candidates:
-        if c and Path(c).is_file():
-            return str(c)
+def find_meeting_capture() -> str | None:
+    """The meeting-capture CLI: brew's opt/ path, then PATH, then the venv."""
+    for c in (*MC_CANDIDATES, _which("meeting-capture"), str(MC_VENV)):
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
     return None
 
 
-# ------------------------------------------------------------------ probe
+def _tail(text: str, n: int = 200) -> str:
+    lines = (text or "").strip().splitlines()
+    return lines[-1][:n] if lines else ""
 
-def _last_json(stdout: str) -> dict | None:
-    for line in reversed((stdout or "").strip().splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            return None
-        return obj if isinstance(obj, dict) else None
+
+def _failed(mc: str | None, why: str) -> dict[str, Any]:
+    return {"status": "error", "mc": mc, "data": None, "error": why}
+
+
+def _problem(data: Any) -> str | None:
+    """Why `data` isn't a schema-1 answer this module can rely on (None if it is)."""
+    if not isinstance(data, dict):
+        return "`meeting-capture stt --json` didn't print a JSON object"
+    if data.get("schema") != SCHEMA:
+        return (f"`meeting-capture stt --json` answers in schema {data.get('schema')!r}, "
+                f"this contorch reads schema {SCHEMA} — upgrade contorch")
+    live = data.get("live")
+    if (data.get("engine") not in ENGINES or not isinstance(data.get("ready"), bool)
+            or not isinstance(data.get("uploads"), bool) or not isinstance(live, dict)
+            or not isinstance(live.get("active"), bool) or not isinstance(live.get("requested"), bool)):
+        return "`meeting-capture stt --json` lacks engine / ready / uploads / live"
     return None
 
 
-def _result(status: str, reason: str, locale: str, info: dict | None = None,
-            exit_code: int | None = None, helper: str | None = None) -> dict[str, Any]:
-    info = info or {}
-    return {
-        # ready | needs_model | unavailable | old_helper | no_helper | error
-        # (+ checking / skipped, which never come from the helper itself)
-        "status": status,
-        "usable": status == "ready",
-        "reason": reason,
-        "locale": str(info.get("locale") or locale),
-        "installed": bool(info.get("installed", status == "ready")),
-        "supported": list(info.get("supported") or []),
-        "installed_locales": list(info.get("installed_locales") or []),
-        "os": str(info.get("os") or ""),
-        "arch": str(info.get("arch") or ""),
-        "exit": exit_code,
-        "helper": helper,
-        "checked_at": time.time(),
-    }
-
-
-def parse_probe(returncode: int, stdout: str, stderr: str, locale: str,
-                helper: str | None = None) -> dict[str, Any]:
-    """Map one `sysaudio transcribe --probe` run onto a status."""
-    err = (stderr or "").strip()
-    if returncode != 0 and "unknown arg" in err.lower():
-        return _result("old_helper", OLD_HELPER_REASON, locale, exit_code=returncode, helper=helper)
-    info = _last_json(stdout)
-    reason = str((info or {}).get("reason") or "").strip()
-    if returncode == 0:
-        if info is None:
-            return _result("error", "the helper's probe printed no status", locale,
-                           exit_code=returncode, helper=helper)
-        if info.get("available") is False:
-            return _result("unavailable", reason or "on-device transcription is not available on this Mac",
-                           locale, info, returncode, helper)
-        return _result("ready", reason or "ready", locale, info, returncode, helper)
-    if returncode == EX_UNAVAILABLE:
-        return _result("unavailable", reason or "on-device transcription is not available on this Mac",
-                       locale, info, returncode, helper)
-    if returncode == EX_TEMPFAIL:
-        return _result("needs_model", reason or f"the speech model for {locale} is not installed",
-                       locale, info, returncode, helper)
-    tail = err.splitlines()[-1][:160] if err else ""
-    return _result("error", reason or f"probe failed (exit {returncode}){': ' + tail if tail else ''}",
-                   locale, info, returncode, helper)
-
-
-def probe(helper: str | None, locale: str, timeout: float = PROBE_TIMEOUT_S) -> dict[str, Any]:
-    """Run the helper's probe once (no cache)."""
-    if not helper:
-        return _result("no_helper", NO_HELPER_REASON, locale)
+def read(mc: str | None = None, timeout: float = READ_TIMEOUT_S) -> dict[str, Any]:
+    """Ask meeting-capture once: {"status": ok|old|error|missing, "mc", "data", "error"}."""
+    mc = mc or find_meeting_capture()
+    if not mc:
+        return {"status": "missing", "mc": None, "data": None, "error": "meeting-capture is not installed"}
     try:
-        r = subprocess.run([helper, "transcribe", "--probe", "--locale", locale],
-                           capture_output=True, text=True, timeout=timeout,
-                           stdin=subprocess.DEVNULL)
+        r = subprocess.run([mc, "stt", "--json"], capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")
     except subprocess.TimeoutExpired:
-        return _result("error", f"the helper's probe timed out after {timeout:.0f}s", locale, helper=helper)
+        return _failed(mc, f"`meeting-capture stt --json` timed out after {timeout:.0f}s")
     except OSError as e:
-        return _result("error", f"could not run {helper}: {e.strerror or e}", locale, helper=helper)
-    return parse_probe(r.returncode, r.stdout, r.stderr, locale, helper)
-
-
-def install_model(helper: str, locale: str, timeout: float = INSTALL_TIMEOUT_S) -> dict[str, Any]:
-    """`sysaudio transcribe --install --locale L` — download/reserve the model."""
+        return _failed(mc, f"can't run {mc}: {e.strerror or e}")
+    if r.returncode == 2:
+        # argparse's usage error: no `stt` subcommand, or no --json. That is
+        # meeting-capture < 0.7, which only transcribes with Gemini.
+        return {"status": "old", "mc": mc, "data": None, "error": None}
+    if r.returncode != 0:
+        return _failed(mc, f"`meeting-capture stt --json` failed (exit {r.returncode}): "
+                           f"{_tail(r.stderr) or 'no detail'}")
     try:
-        r = subprocess.run([helper, "transcribe", "--install", "--locale", locale],
-                           capture_output=True, text=True, timeout=timeout,
-                           stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"timed out after {timeout:.0f}s", "exit": None}
-    except OSError as e:
-        return {"ok": False, "error": str(e), "exit": None}
-    info = _last_json(r.stdout) or {}
-    ok = r.returncode == 0 and info.get("installed", True) is not False
-    err = (r.stderr or "").strip()
-    if r.returncode != 0 and "unknown arg" in err.lower():
-        err = OLD_HELPER_REASON
-    elif r.returncode == EX_UNAVAILABLE and not err:
-        err = f"{locale} is not supported on this Mac"
-    return {"ok": ok, "exit": r.returncode, "seconds": info.get("seconds"),
-            "error": "" if ok else (err.splitlines()[-1][:200] if err else f"exit {r.returncode}")}
+        data = json.loads(r.stdout)
+    except ValueError:
+        return _failed(mc, "`meeting-capture stt --json` printed something that isn't JSON")
+    why = _problem(data)
+    return _failed(mc, why) if why else {"status": "ok", "mc": mc, "data": data, "error": None}
+
+
+def command(hint: str | None, mc: str) -> list[str] | None:
+    """A meeting-capture hint from the JSON ("meeting-capture language en-US")
+    as argv for `mc`. Only `stt` and `language` commands are run; anything
+    else gives None."""
+    try:
+        argv = shlex.split(hint or "")
+    except ValueError:
+        return None
+    if len(argv) < 3 or argv[0] != "meeting-capture" or argv[1] not in ("stt", "language"):
+        return None
+    return [mc, *argv[1:]]
 
 
 # ------------------------------------------------------------------ cache
@@ -299,25 +167,28 @@ _inflight: set[tuple] = set()
 _lock = threading.Lock()
 
 
-def _cache_key(helper: str, locale: str) -> tuple:
+def _sig(path) -> tuple | None:
     try:
-        s = os.stat(helper)
-        sig: tuple | None = (s.st_mtime_ns, s.st_size)
+        s = os.stat(path)
     except OSError:
-        sig = None
-    return (helper, sig, locale)
+        return None
+    return (s.st_mtime_ns, s.st_size)
+
+
+def cache_key(mc: str) -> tuple:
+    return (_sig(PLIST), os.path.realpath(mc), _sig(mc), _sig(KEY_FILE))
 
 
 def _fresh(entry: tuple[float, dict] | None, ttl: float) -> bool:
     if not entry:
         return False
     at, res = entry
-    limit = PROBE_RETRY_S if res.get("status") == "error" else ttl
-    return time.monotonic() - at < limit
+    return time.monotonic() - at < (RETRY_S if res["status"] == "error" else ttl)
 
 
 def _store(key: tuple, res: dict) -> None:
     with _lock:
+        _cache.clear()                      # one meeting-capture, one configuration at a time
         _cache[key] = (time.monotonic(), res)
         _inflight.discard(key)
 
@@ -327,21 +198,21 @@ def clear_cache() -> None:
         _cache.clear()
 
 
-def cached_probe(helper: str | None, locale: str, ttl: float = PROBE_TTL_S,
-                 wait: bool = True) -> dict[str, Any]:
-    """The probe result, re-run at most every `ttl` seconds per (helper
-    binary, locale). With wait=False a missing/stale answer is refreshed on
-    a background thread; until the first one lands this returns status
-    "checking"."""
-    if not helper:
-        return _result("no_helper", NO_HELPER_REASON, locale)
-    key = _cache_key(helper, locale)
+def cached_read(wait: bool = True, ttl: float = TTL_S) -> dict[str, Any]:
+    """read(), re-run at most every `ttl` (RETRY_S after an error) or when the
+    cache key changes. wait=False never blocks: a missing or stale answer is
+    refreshed on a background thread, and until the first one arrives this
+    returns status "checking"."""
+    mc = find_meeting_capture()
+    if not mc:
+        return read(None)
+    key = cache_key(mc)
     with _lock:
         hit = _cache.get(key)
     if _fresh(hit, ttl):
         return hit[1]
     if wait:
-        res = probe(helper, locale)
+        res = read(mc)
         _store(key, res)
         return res
     with _lock:
@@ -351,87 +222,92 @@ def cached_probe(helper: str | None, locale: str, ttl: float = PROBE_TTL_S,
     if start:
         def _bg() -> None:
             try:
-                res = probe(helper, locale)
+                res = read(mc, timeout=BACKGROUND_TIMEOUT_S)
             except Exception as e:  # noqa: BLE001 — never kill the thread silently
-                res = _result("error", f"probe failed: {e}", locale, helper=helper)
+                res = _failed(mc, f"{type(e).__name__}: {e}")
             _store(key, res)
-        threading.Thread(target=_bg, name="stt-probe", daemon=True).start()
+        threading.Thread(target=_bg, name="stt-json", daemon=True).start()
     if hit:
-        return hit[1]   # stale but better than nothing while the refresh runs
-    return _result("checking", "checking…", locale, helper=helper)
+        return hit[1]                       # stale, while the refresh runs
+    return {"status": "checking", "mc": mc, "data": None, "error": None}
 
 
-# ------------------------------------------------------------------ decision
+# ------------------------------------------------------------------ what to show
 
-def resolve(setting: str, locale: str, probe_result: dict, has_key: bool) -> dict[str, Any]:
-    """The engine meeting-capture uses for this setting: apple | gemini |
-    none (nothing can transcribe; audio is kept and retried) | checking."""
-    p = probe_result or {}
-    why = p.get("reason") or "on-device transcription is unavailable"
-    if p.get("status") == "needs_model":
-        why += f" (install it: meeting-capture language {locale})"
-    if setting == "gemini":
-        if has_key:
-            return {"engine": "gemini", "reason": "set to Gemini"}
-        return {"engine": "none", "reason": "set to Gemini, but there is no Gemini API key"}
-    if p.get("status") == "checking":
-        return {"engine": "checking", "reason": "checking…"}
-    if p.get("usable"):
-        return {"engine": "apple",
-                "reason": "on-device only" if setting == "apple" else "available on this Mac"}
-    if setting == "apple":
-        return {"engine": "none", "reason": f"{why} (set to on-device only — audio is kept until it works)"}
-    if has_key:
-        return {"engine": "gemini", "reason": f"on-device unavailable: {why}"}
-    return {"engine": "none", "reason": f"{why}, and there is no Gemini API key"}
+def privacy(data: dict | None) -> str | None:
+    """Where meeting audio goes. Based only on the JSON's "uploads" and
+    "live.active"; None when that isn't known."""
+    if not data:
+        return None
+    if data["live"]["active"]:
+        return "every call streams to Google Gemini as it happens (live mode)"
+    if data["uploads"]:
+        return "meeting audio is uploaded to Google Gemini for transcription"
+    if data["engine"] == "none":
+        return "nothing transcribes yet: recordings wait on this Mac"
+    return "meeting audio never leaves this Mac"
 
 
-def label(state: dict) -> str:
-    """'on this Mac (en-US)' / 'Gemini' / 'unavailable — <reason>' / 'checking…',
-    plus ' · live: calls stream to Gemini' while live mode uploads every call."""
-    engine = state.get("engine")
-    if engine == "apple":
-        loc = (state.get("probe") or {}).get("locale") or state.get("locale") or DEFAULT_LOCALE
-        text = f"on this Mac ({loc})"
-    elif engine == "gemini":
-        text = "Gemini"
-    elif engine == "checking":
-        text = "checking…"
+def label(view: dict) -> str:
+    """'on this Mac (en-US)' / 'Gemini' / 'unavailable — <why>', plus
+    ' · live: calls stream to Gemini' while live mode streams; the fallbacks'
+    own labels otherwise."""
+    status = view["status"]
+    if status == "checking":
+        return "checking…"
+    if status == "old":
+        return OLD_LABEL
+    if status != "ok":
+        return f"unknown — {view.get('error') or status}"
+    d = view["data"]
+    if not d["ready"] or d["engine"] == "none":
+        text = f"unavailable — {d.get('reason') or 'no engine can run'}"
+    elif d["engine"] == "apple":
+        text = f"on this Mac ({d.get('locale')})"
     else:
-        text = f"unavailable — {state.get('reason') or 'unknown'}"
-    if (state.get("live") or {}).get("streaming"):
+        text = "Gemini"
+    if d["live"]["active"]:
         text += f" · {LIVE_LABEL}"
     return text
 
 
-def current(wait: bool = True, ttl: float = PROBE_TTL_S, env: dict | None = None,
-            plist: Path | None = None) -> dict[str, Any]:
-    """Everything the menu bar / doctor show about transcription, including
-    whether live mode streams calls to Gemini ("live").
-    The helper is probed only when the setting can use it (auto / apple)."""
-    plist = Path(plist or PLIST)
-    env = plist_env(plist) if env is None else env
-    raw = str(env.get(STT_ENV, "")).strip()
-    setting = setting_from_env(env)
-    loc = locale_from_env(env)
-    key = has_gemini_key(env)
-    helper = find_helper(env)
-    if setting == "gemini":
-        p = _result("skipped", "not checked (set to Gemini)", loc, helper=helper)
-    else:
-        p = cached_probe(helper, loc, ttl=ttl, wait=wait)
-    state = resolve(setting, loc, p, key)
-    out = {
-        "ok": True,
-        "installed": plist.is_file(),
-        "setting": setting,
-        "configured": raw or (f"auto (legacy {LEGACY_ENV}={env[LEGACY_ENV]})" if env.get(LEGACY_ENV) else "auto"),
-        "locale": loc,
-        "has_key": key,
-        "helper": helper,
-        "probe": p,
-        "live": live_state(env, key),
-        **state,
+def view(reading: dict) -> dict[str, Any]:
+    """A read() result as the menu bar, status, doctor and setup show it."""
+    status, d = reading["status"], reading.get("data")
+    out: dict[str, Any] = {
+        "status": status,
+        "ok": status != "missing",          # something to show (missing: the menu greys it out)
+        "mc": reading.get("mc"),
+        "error": reading.get("error"),
+        "data": d,
+        # apple | gemini | none from meeting-capture; an old meeting-capture
+        # only has Gemini; error/checking: not known
+        "engine": d["engine"] if d else ("gemini" if status == "old" else status),
+        # nothing can transcribe: the menu's ⚠
+        "attention": bool(d) and not d["ready"],
+        # audio leaves this Mac: True / False / None (unknown)
+        "leaves_mac": (d["uploads"] or d["live"]["active"]) if d else (True if status == "old" else None),
+        "privacy": privacy(d) if d else (
+            "meeting audio is uploaded to Google Gemini for transcription" if status == "old" else None),
     }
     out["label"] = label(out)
     return out
+
+
+def current(wait: bool = True, ttl: float = TTL_S) -> dict[str, Any]:
+    """view(cached_read()). Never raises."""
+    try:
+        return view(cached_read(wait=wait, ttl=ttl))
+    except Exception as e:  # noqa: BLE001 — status/doctor/menu must still render
+        return view(_failed(None, f"{type(e).__name__}: {e}"))
+
+
+def fresh(mc: str | None = None, timeout: float = READ_TIMEOUT_S) -> dict[str, Any]:
+    """view(read()) right now, bypassing the cache (setup, after a change)."""
+    try:
+        res = read(mc, timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        res = _failed(mc, f"{type(e).__name__}: {e}")
+    if res.get("mc"):
+        _store(cache_key(res["mc"]), res)
+    return view(res)

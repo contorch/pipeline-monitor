@@ -265,15 +265,13 @@ def capture_mode_status() -> dict[str, Any]:
 # ----------------------------------------------------------- transcription engine
 
 def transcription_status(wait: bool = False) -> dict[str, Any]:
-    """Which engine meeting-capture transcribes with: on this Mac (Apple
-    on-device speech, with its locale), Gemini, or unavailable (and why).
-
-    Read cheaply — see pipeline_monitor.transcription: the setting and locale
-    come from the agent's plist env (MEETING_CAPTURE_STT / _LOCALE), on-device
-    availability from a cached probe of the sysaudio helper (re-run every
-    15 min or when the helper binary / locale changes, on a background
-    thread unless wait=True). Not from the daemon log.
-    """
+    """How meeting-capture transcribes: on this Mac (with its language),
+    Gemini, or unavailable (and why), plus whether live mode streams calls and
+    where audio goes. Asked from meeting-capture (`meeting-capture stt
+    --json`; pipeline_monitor.transcription), never re-derived here. The
+    answer is cached and refreshed on a background thread unless wait=True,
+    so the 5-second timer never waits on it. {"ok": False} without the
+    recorder's launchd agent (the menu leaves the line out)."""
     try:
         if not stt.PLIST.exists():
             return {"ok": False, "installed": False,
@@ -634,8 +632,8 @@ class Snapshot:
           - chroma daemon unreachable
           - any installed launchd daemon stopped
           - MCP server has a recent tool-call failure (not just idle)
-          - nothing can transcribe (no on-device speech and no Gemini key):
-            meetings are recorded but stay untranscribed
+          - nothing can transcribe (meeting-capture's `stt --json` says not
+            ready): meetings are recorded but stay untranscribed
         We deliberately do NOT flag MCP as 'err' just because it hasn't
         seen a tool call recently — Claude Code might just not be open.
         """
@@ -659,7 +657,7 @@ class Snapshot:
         for label, info in self.launchd.get("daemons", {}).items():
             if info.get("installed") and not info.get("running"):
                 problems.append(label.split(".")[-1])
-        if self.transcription.get("ok") and self.transcription.get("engine") == "none":
+        if self.transcription.get("ok") and self.transcription.get("attention"):
             problems.append("transcription")
         # Only flag MCP if its MOST RECENT call failed (active problem),
         # not if it's been idle.
@@ -679,7 +677,7 @@ class Snapshot:
 
 def collect(wait: bool = False) -> Snapshot:
     """Run every collector and return a snapshot. Each call is sub-second
-    (the transcription probe runs in the background unless wait=True)."""
+    (meeting-capture is asked in the background unless wait=True)."""
     return Snapshot(
         chroma=chroma_status(),
         db=db_status(),

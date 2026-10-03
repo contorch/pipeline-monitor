@@ -110,32 +110,36 @@ def test_chroma_down_is_not_an_error_when_embeddings_are_off():
 
 # ------------------------------------------------------------ transcription engine
 
-def test_transcription_status_without_the_agent():
+def test_transcription_status_without_the_agent(fake_mc):
     t = st.transcription_status()
     assert t["ok"] is False and "not installed" in t["error"]
+    assert fake_mc.calls() == []                     # nothing to ask without the recorder
 
 
-def test_transcription_status_reads_plist_and_probes_in_the_background(tmp_path):
-    from conftest import calls, fake_helper, write_plist
-    binary, log = fake_helper(tmp_path)
-    write_plist(st.stt.PLIST, {"MEETING_CAPTURE_SYSAUDIO": str(binary)})
-    first = st.transcription_status()                # menu bar: never blocks on the helper
-    assert first["ok"] and first["engine"] == "checking"
-    deadline = time.time() + 10
+def test_transcription_status_asks_meeting_capture_in_the_background(fake_mc):
+    from conftest import write_plist
+    write_plist(st.stt.PLIST, {})
+    fake_mc.set(sleep=0.3)
+    first = st.transcription_status()                # menu bar: never blocks on meeting-capture
+    assert first["ok"] and first["status"] == "checking"
+    deadline = time.time() + 15
     while time.time() < deadline:
         t = st.transcription_status()
-        if t["engine"] != "checking":
+        if t["status"] != "checking":
             break
         time.sleep(0.05)
     assert t["engine"] == "apple" and t["label"] == "on this Mac (en-US)"
     for _ in range(5):                               # 5-second refreshes reuse the answer
         st.transcription_status()
-    assert len(calls(log)) == 1
+    assert fake_mc.reads() == 1
 
 
-@pytest.mark.parametrize("engine,overall", [("apple", "ok"), ("gemini", "ok"), ("checking", "ok"),
-                                            ("none", "err")])
-def test_overall_flags_when_nothing_can_transcribe(engine, overall):
-    snap = st.Snapshot(chroma={"ok": True}, transcription={"ok": True, "engine": engine})
-    assert snap.overall() == overall
-    assert st.Snapshot(chroma={"ok": True}, transcription={"ok": False}).overall() == "ok"
+@pytest.mark.parametrize("t,overall", [
+    ({"ok": True, "status": "ok", "attention": False}, "ok"),
+    ({"ok": True, "status": "checking", "attention": False}, "ok"),
+    ({"ok": True, "status": "error", "attention": False}, "ok"),     # unknown: not flagged
+    ({"ok": True, "status": "ok", "attention": True}, "err"),        # nothing can transcribe
+    ({"ok": False, "attention": True}, "ok"),
+])
+def test_overall_flags_when_nothing_can_transcribe(t, overall):
+    assert st.Snapshot(chroma={"ok": True}, transcription=t).overall() == overall

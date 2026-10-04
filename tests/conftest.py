@@ -215,7 +215,11 @@ class FakeMeetingCapture:
         return sum(c == ["stt", "--json"] for c in self.calls())
 
     def changes(self) -> list[list[str]]:
-        return [c for c in self.calls() if c != ["stt", "--json"]]
+        """Calls that change something (reads — `stt --json [--check-key]`,
+        `… --json` documents — left out)."""
+        reads = (["stt", "--json"], ["config", "--json"], ["status", "--json"], ["check", "--json"],
+                 ["where", "--json"])
+        return [c for c in self.calls() if c[:2] not in reads]
 
 
 @pytest.fixture

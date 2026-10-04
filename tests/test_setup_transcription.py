@@ -199,8 +199,9 @@ def test_dutch_mac_choosing_on_device_with_gemini_as_backup_runs_the_hint(fake_m
     fake_mc.set(json=mc_json(**DUTCH), after={"language en-US": mc_json(locale_source="setting",
                                                                         gemini_key=True, gemini_fallback=True)})
     _key_file()
-    Answers(monkeypatch, inputs=["2"])
+    term = Answers(monkeypatch, inputs=["3"])          # on a Dutch Mac Gemini is offered first
     cmd, out, todo = _choose(fake_mc)
+    assert "1. Gemini" in out and "3. On this Mac (en-US), Gemini as backup" in out
     assert cmd == [str(fake_mc.path), "language", "en-US"]
     ct._apply_stt(cmd, lambda _: None, [])
     out, todo, done = _report(fake_mc)
@@ -370,44 +371,30 @@ def test_unavailable_shell_only_key_non_interactive_is_a_todo(fake_mc, monkeypat
     assert len(todo) == 1 and todo[0].startswith("Add a Gemini key") and "GOOGLE_API_KEY in your shell" in todo[0]
 
 
-# ------------------------------------------------------------ whole setup
+# ------------------------------------------------------------ whole setup (the details: test_setup_modules.py)
 
-@pytest.fixture
-def stack(tmp_path, monkeypatch, env, fake_mc):
-    bins = {"meeting-capture": str(fake_mc.path), **{n: f"/x/{n}" for n in (
-        "context-orchestrator-chroma", "transcript-watcher", "contorch-mcp", "claude")}}
-    monkeypatch.setattr(ct.shutil, "which", lambda n: bins.get(n))     # no brew
-    monkeypatch.setattr(ct.owners, "locate", lambda n: bins.get(n))
-    monkeypatch.setattr(ct, "CLAUDE_JSON", tmp_path / "claude.json")
-    monkeypatch.setattr(ct, "CLAUDE_MD", tmp_path / "CLAUDE.md")
-    monkeypatch.setattr(ct, "STATE_DIR", tmp_path / "state")
-    monkeypatch.setattr(ct, "STOPPED_MARKER", tmp_path / "state" / "stopped.json")
-    monkeypatch.setattr(ct, "CHROMA_DIR", tmp_path / "chroma")
-    monkeypatch.setattr(ct, "_launchctl", lambda *a: subprocess.CompletedProcess(a, 0, "", ""))
-    monkeypatch.setattr(ct, "_chroma_up", lambda timeout_s: True)
-    monkeypatch.setattr(ct, "_contorch_memory_bin", lambda: None)
-    return env
+from test_setup_modules import stack  # noqa: E402,F401  (the scratch install every setup test uses)
 
 
 def test_setup_succeeds_without_a_key_when_this_mac_transcribes(fake_mc, monkeypatch, stack):
     term = Answers(monkeypatch)                                      # Enter at every prompt
     out: list[str] = []
-    assert ct.setup(log=out.append) is True
+    assert ct.setup(log=out.append) is True, "\n".join(out)
     text = "\n".join(out)
     assert term.key_prompts == 0 and not ct.KEY_FILE.exists()
     assert "Google Gemini for transcription" not in text and "✗" not in text
     assert "✓ Transcription: on this Mac (en-US)" in text
-    assert [str(fake_mc.path), "install"] in stack
-    assert fake_mc.changes() == []                                   # the default needs no change
+    assert ["install", "--json"] in fake_mc.calls()
+    assert not any(c[0] in ("stt", "language") for c in fake_mc.changes())   # the default needs no change
 
 
 def test_setup_applies_gemini_after_installing_the_recorder_then_rereads(fake_mc, monkeypatch, stack):
-    fake_mc.set(after={"stt gemini": mc_json(choice="gemini", engine="gemini", uploads=True, gemini_key=True)})
-    Answers(monkeypatch, inputs=["2"], keys=["AIza-new"])
+    stack.mc_after("stt gemini", mc_json(choice="gemini", engine="gemini", uploads=True, gemini_key=True))
+    Answers(monkeypatch, inputs=["", "", "2"], keys=["AIza-new"])    # record: yes; line-in: no; engine: Gemini
     out: list[str] = []
-    assert ct.setup(log=out.append) is True
+    assert ct.setup(log=out.append) is True, "\n".join(out)
     text = "\n".join(out)
-    assert fake_mc.changes() == [["stt", "gemini"]]
+    assert ["stt", "gemini"] in fake_mc.changes()
     assert text.index("✓ capture daemon running") < text.index("$ meeting-capture stt gemini")
     assert "Meeting audio is uploaded to Google Gemini" in text and "✓ Transcription: Gemini" in text
 
@@ -417,10 +404,10 @@ def test_setup_on_a_dutch_mac_never_promises_on_device(fake_mc, monkeypatch, sta
     _key_file()
     Answers(monkeypatch)
     out: list[str] = []
-    assert ct.setup(log=out.append) is True
+    assert ct.setup(log=out.append) is True, "\n".join(out)
     text = "\n".join(out)
     assert "never leaves" not in text and "✓ Transcription: Gemini" in text
-    assert fake_mc.changes() == []
+    assert not any(c[0] in ("stt", "language") for c in fake_mc.changes())
 
 
 def test_setup_in_live_mode_reports_the_stream_in_the_summary(fake_mc, monkeypatch, stack):
@@ -428,7 +415,7 @@ def test_setup_in_live_mode_reports_the_stream_in_the_summary(fake_mc, monkeypat
     _key_file()
     Answers(monkeypatch)
     out: list[str] = []
-    assert ct.setup(log=out.append) is True
+    assert ct.setup(log=out.append) is True, "\n".join(out)
     text = "\n".join(out)
     assert "never leaves this Mac" not in text
     assert "✓ Transcription: on this Mac (en-US) · live: calls stream to Gemini" in text
@@ -528,3 +515,56 @@ def test_doctor_with_an_old_or_unreadable_meeting_capture(agent, capsys):
     agent.set(mode="garbage")
     rc, out = _doctor(capsys)
     assert rc == 1 and "✗ unknown — " in out and "audio:" not in out
+
+
+# ------------------------------------------------------------ meeting-capture's on_device_line (≥ 0.8)
+
+DUTCH_08 = dict(DUTCH, on_device_for_mac_language=False,
+                on_device_line="This Mac can't transcribe its own language (nl-NL) on-device; it could only do "
+                               "en-US meetings (`meeting-capture language en-US`).")
+
+
+def test_setup_prints_meeting_captures_own_line_and_never_claims_this_mac_can_transcribe(fake_mc, monkeypatch,
+                                                                                          env):
+    fake_mc.set(json=mc_json(**DUTCH_08))
+    _key_file()
+    Answers(monkeypatch)
+    cmd, out, todo = _choose(fake_mc)
+    assert "· This Mac can't transcribe its own language (nl-NL) on-device" in out
+    assert "This Mac can transcribe meetings itself" not in out
+    first = [l for l in out.splitlines() if l.strip().startswith("1.")][0]
+    assert "Gemini" in first                             # On this Mac isn't offered first
+
+
+def test_on_this_mac_is_offered_first_when_it_covers_the_macs_language(fake_mc, monkeypatch, env):
+    fake_mc.set(json=mc_json(on_device_for_mac_language=True,
+                             on_device_line="This Mac can transcribe meetings itself (Apple on-device speech, "
+                                            "en-US) — no API key needed."))
+    Answers(monkeypatch)
+    cmd, out, todo = _choose(fake_mc)
+    assert "✓ This Mac can transcribe meetings itself (Apple on-device speech, en-US)" in out
+    first = [l for l in out.splitlines() if l.strip().startswith("1.")][0]
+    assert "On this Mac" in first
+
+
+def test_meeting_capture_0_7_without_the_line_claims_nothing_for_a_guessed_language(fake_mc, monkeypatch, env):
+    fake_mc.set(json=mc_json(**DUTCH))                    # 0.7: no on_device_line
+    _key_file()
+    Answers(monkeypatch)
+    cmd, out, todo = _choose(fake_mc)
+    assert "This Mac can transcribe meetings itself" not in out
+    assert "covers en-US, not this Mac's language (nl-NL)" in out
+
+
+def test_a_typed_key_is_checked_with_meeting_capture(fake_mc, monkeypatch, env):
+    import json as _j
+    fake_mc.set(json=mc_json(**UNAVAILABLE),
+                lines={"stt --json --check-key": [_j.dumps(dict(mc_json(**UNAVAILABLE),
+                                                                key_check={"key": "rejected",
+                                                                           "message": "API key not valid"}))]})
+    Answers(monkeypatch, keys=["AIza-bad"])
+    log, todo = [], []
+    ok = ct._need_key(log.append, todo, str(fake_mc.path))
+    assert ok is False
+    assert any("Google rejected the Gemini key: API key not valid" in l for l in log)
+    assert any("rejected" in t for t in todo)

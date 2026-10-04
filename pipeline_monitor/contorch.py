@@ -5,6 +5,9 @@
     contorch status     what is installed, running, stopped; how meetings are transcribed
     contorch stop       stop every background daemon, and keep them stopped across login
     contorch resume     start them again, in dependency order, and check they came up
+    contorch channel    which install (app / brew / dev) owns Contorch on this Mac
+    contorch modules    memory, recorder, line-in, terminal commands: present / wanted / on
+    contorch cli        put Contorch.app's commands on your PATH (app only)
 
 The daemons are per-user launchd agents written by each component's own
 installer (meeting-capture, context-orchestrator's chroma server and
@@ -28,6 +31,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+from . import owners
 from . import transcription as stt
 
 LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
@@ -148,6 +152,27 @@ def stop(log=print) -> bool:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STOPPED_MARKER.write_text(json.dumps({"at": time.time(), "labels": [a["label"] for a in found]}))
     return ok
+
+
+def _cli_stack(sub) -> None:
+    sub.add_parser("stop", help="stop every contorch daemon and keep them stopped across login").set_defaults(
+        func=_cmd_stop)
+    sub.add_parser("resume", help="start every contorch daemon again, in order").set_defaults(func=_cmd_resume)
+
+
+def _cmd_stop(args) -> int:
+    print("Stopping contorch…")
+    ok = stop()
+    print("\nStopped. Nothing records, indexes, or answers searches until `contorch resume`."
+          if ok else "\nStopped with errors (above).")
+    return 0 if ok else 1
+
+
+def _cmd_resume(args) -> int:
+    print("Resuming contorch…")
+    ok = resume()
+    print("\nRunning." if ok else "\nResumed with errors (above). `contorch status` for details.")
+    return 0 if ok else 1
 
 
 def resume(log=print) -> bool:
@@ -351,11 +376,7 @@ EMBEDDING_CHOICES = (
 
 
 def _contorch_memory_bin() -> str | None:
-    for c in (shutil.which("contorch-memory"),
-              str(Path.home() / ".context-orchestrator" / "venv" / "bin" / "contorch-memory")):
-        if c and Path(c).is_file():
-            return c
-    return None
+    return owners.locate("contorch-memory")
 
 
 def _setup_embeddings(log, todo: list, done: list, choice: str | None = None) -> None:
@@ -589,6 +610,11 @@ def _report_transcription(mc: str, log, todo: list, done: list) -> None:
         done.append(f"Transcription: {t['label']}")
 
 
+def _cli_setup(sub) -> None:
+    sub.add_parser("setup", help="configure everything after installing (safe to re-run)").set_defaults(
+        func=lambda args: 0 if setup() else 1)
+
+
 def setup(log=print) -> bool:
     """Everything scriptable, in order, then an honest list of what is left."""
     todo: list[str] = []
@@ -599,7 +625,7 @@ def setup(log=print) -> bool:
 
     # 0. What is installed?
     step("Checking components")
-    bins = {n: shutil.which(n) for n in ("meeting-capture", "context-orchestrator-chroma",
+    bins = {n: owners.locate(n) for n in ("meeting-capture", "context-orchestrator-chroma",
                                           "transcript-watcher", "contorch-mcp")}
     missing = [n for n, p in bins.items() if not p]
     if missing:
@@ -797,11 +823,15 @@ def _print_transcription_detail() -> int:
     return 0 if good else 1
 
 
+def _cli_doctor(sub) -> None:
+    sub.add_parser("doctor", help="health-check every component").set_defaults(func=lambda args: doctor())
+
+
 def doctor() -> int:
     rc = _print_status(transcription=False)
     rc = _print_transcription_detail() or rc
     for name in ("meeting-capture", "transcript-watcher"):
-        b = shutil.which(name)
+        b = owners.locate(name)
         if not b:
             print(f"\n✗ {name} not on PATH")
             rc = 1
@@ -817,6 +847,11 @@ def doctor() -> int:
 
 
 # ------------------------------------------------------------------ CLI
+
+def _cli_status(sub) -> None:
+    sub.add_parser("status", help="show every contorch daemon, whether it is running, and the "
+                                  "transcription engine").set_defaults(func=lambda args: _print_status())
+
 
 def _print_status(transcription: bool = True) -> int:
     rows = status()
@@ -845,33 +880,27 @@ def _print_status(transcription: bool = True) -> int:
     return 0
 
 
+# Commands that live in their own modules: each defines add_cli(subparsers)
+# and sets `func`. A module that isn't in this install is skipped.
+CLI_MODULES = ("channel", "modules", "adopt", "uninstall", "lifecycle", "diagnostics")
+
+
+def _module_clis(sub) -> None:
+    import importlib
+    import importlib.util
+    for name in CLI_MODULES:
+        if importlib.util.find_spec(f"pipeline_monitor.{name}") is not None:
+            importlib.import_module(f"pipeline_monitor.{name}").add_cli(sub)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="contorch", description="Control the whole contorch stack.")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("setup", help="configure everything after installing (safe to re-run)")
-    sub.add_parser("doctor", help="health-check every component")
-    sub.add_parser("status", help="show every contorch daemon, whether it is running, and the transcription engine")
-    sub.add_parser("stop", help="stop every contorch daemon and keep them stopped across login")
-    sub.add_parser("resume", help="start every contorch daemon again, in order")
+    for add in (_cli_setup, _cli_doctor, _cli_status, _cli_stack):
+        add(sub)
+    _module_clis(sub)
     args = p.parse_args(argv)
-    if args.cmd == "setup":
-        return 0 if setup() else 1
-    if args.cmd == "doctor":
-        return doctor()
-    if args.cmd == "status":
-        return _print_status()
-    if args.cmd == "stop":
-        print("Stopping contorch…")
-        ok = stop()
-        print("\nStopped. Nothing records, indexes, or answers searches until `contorch resume`."
-              if ok else "\nStopped with errors (above).")
-        return 0 if ok else 1
-    if args.cmd == "resume":
-        print("Resuming contorch…")
-        ok = resume()
-        print("\nRunning." if ok else "\nResumed with errors (above). `contorch status` for details.")
-        return 0 if ok else 1
-    return 2
+    return args.func(args)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from AppKit import NSObject
 from PyObjCTools import AppHelper  # noqa: F401  (ensures AppKit init order)
 
 from . import contorch as ct
+from . import owners
 from . import status as st
 from . import transcription as stt
 from .smoketest import run_smoke_test
@@ -225,9 +226,10 @@ def _transcription_details(snap: st.Snapshot) -> list[str]:
 
 
 def _meeting_capture_bin() -> str | None:
-    """The meeting-capture CLI (brew's opt/ path first: launchd gives this
-    app no shell PATH). The same lookup the transcription line uses."""
-    return stt.find_meeting_capture()
+    """The meeting-capture CLI (owners.locate, pm's one binary locator:
+    the app's bundle, else brew's opt/ path first — launchd gives this app no
+    shell PATH). The same lookup the transcription line uses."""
+    return owners.locate("meeting-capture")
 
 
 def _build_index_line(snap: st.Snapshot) -> rumps.MenuItem:

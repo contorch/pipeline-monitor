@@ -1,0 +1,58 @@
+name: tests
+
+# The unit suite on every PR and push to main. Until this existed
+# pipeline-monitor's tests only ever ran on a developer's Mac.
+#
+# Nothing here touches launchd, Homebrew, Claude Code or a real recorder: the
+# tests run against scratch HOMEs and fake owner CLIs (tests/conftest.py).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pytest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+        python: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - name: Install (with the app extra, so its real import is exercised)
+        run: python -m pip install -q -e '.[dev,app]'
+      - name: pytest
+        run: python -m pytest -q tests
+      - name: The menu bar module imports (rumps + AppKit on a real macOS runner)
+        run: python -c "import pipeline_monitor.app as a; assert a.GLYPH_TEMPLATE.is_file(), a.GLYPH_TEMPLATE"
+
+  # pipeline-monitor owns the channel-guard rule and its fixtures; the readers
+  # live in meeting-capture (channel_guard.py) and context-orchestrator (a
+  # sourced bash file). Run both readers, from their main branches, against
+  # this commit's fixtures, so a fixture change that a reader disagrees with
+  # fails here before the readers re-pin it.
+  contract:
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Fetch the readers
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/readers"
+          curl -fsSL https://raw.githubusercontent.com/contorch/meeting-capture/main/src/meeting_capture/channel_guard.py \
+            -o "$RUNNER_TEMP/readers/channel_guard.py"
+          curl -fsSL https://raw.githubusercontent.com/contorch/context-orchestrator/main/scripts/contorch_channel_guard.sh \
+            -o "$RUNNER_TEMP/readers/contorch_channel_guard.sh"
+      - name: Every reader agrees with every fixture (bash reader under macOS's /bin/bash 3.2)
+        run: |
+          python3 scripts/check_guard_readers.py \
+            --mc "$RUNNER_TEMP/readers/channel_guard.py" \
+            --co "$RUNNER_TEMP/readers/contorch_channel_guard.sh"

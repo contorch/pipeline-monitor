@@ -8,6 +8,11 @@ dependencies = [
     "httpx>=0.27.0",
 ]
 
+[project.optional-dependencies]
+# Inside Contorch.app: notifications through UNUserNotificationCenter.
+app = ["pyobjc-framework-UserNotifications; sys_platform == 'darwin'"]
+dev = ["pytest"]
+
 [project.scripts]
 pipeline-monitor = "pipeline_monitor.app:main"
 contorch = "pipeline_monitor.contorch:main"

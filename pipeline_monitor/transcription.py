@@ -16,31 +16,43 @@ promised "audio never leaves this Mac" on a Dutch Mac where meeting-capture
 picks Gemini.
 
   * find_meeting_capture(): the Homebrew opt/ path (Apple silicon, then
-    Intel), then PATH, then the per-user venv of a source install.
-  * read(): runs it once, with a timeout. The result is one of
+    Intel), then PATH, then the per-user venv of a source install. That is
+    what setup runs commands with (`meeting-capture stt apple`, …).
+  * find_reader(): what a read runs. Homebrew's meeting-capture is a bash
+    wrapper that, after an install or a `brew upgrade`, deletes and rebuilds
+    ~/.meeting-capture/venv with pip — the venv the launchd recorder runs
+    from, so a rebuild under a running recorder breaks its lazy imports
+    mid-meeting, and two rebuilds at once break each other. A read must never
+    start one. So when the CLI is that wrapper, reads run the venv's own
+    `meeting-capture` (the code the recorder actually runs), with the
+    wrapper's MEETING_CAPTURE_SYSAUDIO. Venv not built: no read, "run
+    `meeting-capture install`". Its version stamp differs from the wrapper's
+    version: read the venv (still what the recorder runs) and add a note.
+    Only setup, in the foreground, reads through the wrapper (fresh()).
+  * read(): runs it once, with a timeout that kills its whole process
+    group. The result is one of
       ok       the JSON
-      old      meeting-capture < 0.7: no `stt --json`, so a usage error
+      old      meeting-capture < 0.7: no `stt —json`, so a usage error
                (exit 2). It transcribes with Gemini only, so the result is
                never "on this Mac".
-      error    it failed, timed out, printed something unparsable, or used
-               a schema this contorch doesn't know. The result is unknown:
-               never "on this Mac", and no privacy claim.
+      error    it failed, timed out, printed something unparsable, used a
+               schema this contorch doesn't know, or isn't set up yet. The
+               result is unknown: never "on this Mac", and no privacy claim.
       missing  meeting-capture isn't installed.
-  * current(wait): read() cached per (plist mtime, the meeting-capture
-    executable's resolved path + mtime + size, the key file's mtime or
-    absence). A `meeting-capture stt|language|mode` change rewrites the plist
-    and a `brew upgrade` replaces the executable, so both show up on the next
-    refresh. Otherwise an answer lasts TTL_S (10 min; the Mac's language can
-    change too) and an error RETRY_S (60 s). With wait=False (the menu bar's
-    5-second timer) a stale answer is refreshed on a background thread.
-    "checking" is returned until the first answer arrives, so the menu never
-    waits on a subprocess.
+  * current(wait): read() cached per (plist mtime, the CLI and the reader:
+    resolved path + mtime + size, the venv's version stamp, the key file's
+    mtime or absence). A `meeting-capture stt|language|mode` change rewrites
+    the plist, and a `brew upgrade` or venv rebuild changes the CLI or the
+    stamp, so both show up on the next refresh. Otherwise an answer lasts
+    TTL_S (10 min; the Mac's language can change too) and an error RETRY_S
+    (60 s). With wait=False (the menu bar's 5-second timer) a stale answer is
+    refreshed on a background thread. "checking" is returned until the first
+    answer arrives, so the menu never waits on a subprocess.
   * privacy(): the only place that says where audio goes. It uses nothing
-    but the JSON's "uploads" and "live.active".
-
-The reads go through the brew wrapper, which builds meeting-capture's venv the
-first time it runs after an install or a `brew upgrade` (a pip install, which
-takes time). For that reason the timeouts are generous.
+    but the JSON's "live.active", "uploads" and "may_upload": "never leaves
+    this Mac" only when may_upload is false. (may_upload is also true for
+    auto with a key: meeting-capture hands a chunk to Gemini by itself when
+    on-device transcription fails.)
 
 Stdlib only: the menu bar and the `contorch` CLI share it.
 """
@@ -48,8 +60,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -66,20 +80,27 @@ MC_CANDIDATES = (
     "/opt/homebrew/opt/meeting-capture/bin/meeting-capture",
     "/usr/local/opt/meeting-capture/bin/meeting-capture",
 )
-MC_VENV = HOME / ".meeting-capture" / "venv" / "bin" / "meeting-capture"
+# meeting-capture's per-user venv (the brew wrapper's MEETING_CAPTURE_VENV
+# default): what the recorder runs, and what reads run.
+VENV = Path(os.environ.get("MEETING_CAPTURE_VENV") or HOME / ".meeting-capture" / "venv")
+MC_VENV = VENV / "bin" / "meeting-capture"
+MC_STAMP = VENV / ".formula-version"
 
 SCHEMA = 1                    # the `meeting-capture stt --json` schema this module reads
-# Normally ~0.2 s, and meeting-capture bounds its own helper probe (20 s). The
-# long tail is the brew wrapper building meeting-capture's venv on its first
-# run after an install or upgrade: a timeout must not kill that pip install.
-READ_TIMEOUT_S = 300.0        # contorch status / doctor / setup
-BACKGROUND_TIMEOUT_S = 600.0  # the menu bar's read, on its own thread
+# A read runs the venv's meeting-capture, never a venv build: ~0.2 s, and
+# meeting-capture bounds each helper probe (20 s, at most two).
+READ_TIMEOUT_S = 60.0         # contorch status / doctor, and the menu bar's thread
+# Setup reads through the brew wrapper, in the foreground: its first run
+# after an install or upgrade builds the venv with pip (minutes).
+SETUP_READ_TIMEOUT_S = 900.0
 TTL_S = 600.0
 RETRY_S = 60.0
 
 OLD_LABEL = "Gemini (meeting-capture < 0.7 — upgrade for on-device)"
 LIVE_LABEL = "live: calls stream to Gemini"
 ENGINES = ("apple", "gemini", "none")
+NOT_BUILT = ("meeting-capture isn't set up yet (no ~/.meeting-capture/venv) — run `meeting-capture install` "
+             "or `contorch setup`")
 
 
 # ------------------------------------------------------------------ locate + read
@@ -94,6 +115,64 @@ def find_meeting_capture() -> str | None:
         if c and os.path.isfile(c) and os.access(c, os.X_OK):
             return c
     return None
+
+
+_STAMP_CHECK = re.compile(rb'\$\(cat "\$STAMP"[^)]*\)" != "([^"]+)"')
+_SYSAUDIO_DEFAULT = re.compile(rb'MEETING_CAPTURE_SYSAUDIO:-([^}"]+)\}')
+
+
+def _wrapper(path: str) -> bytes | None:
+    """The text of a Homebrew meeting-capture wrapper, or None when `path`
+    isn't one (a source install's console script, a test's fake)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16384)
+    except OSError:
+        return None
+    return head if head.startswith(b"#!") and b".formula-version" in head else None
+
+
+def wrapper_version(path: str) -> str | None:
+    """The formula version a Homebrew wrapper builds its venv for ("" if it
+    can't be read from it), or None when `path` isn't that wrapper."""
+    text = _wrapper(path)
+    if text is None:
+        return None
+    m = _STAMP_CHECK.search(text)
+    return m.group(1).decode("utf-8", "replace") if m else ""
+
+
+def _stamp() -> str | None:
+    try:
+        return MC_STAMP.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def find_reader(mc: str | None = None) -> dict[str, Any] | None:
+    """What a read runs — never the brew wrapper (module doc): {"argv0",
+    "env", "mc", "note", "error"}, or None when meeting-capture isn't
+    installed. "error" set: nothing to run."""
+    mc = mc or find_meeting_capture()
+    if not mc:
+        return None
+    text = _wrapper(mc)
+    if text is None:
+        return {"argv0": mc, "env": None, "mc": mc, "note": None, "error": None}
+    version = wrapper_version(mc)
+    if not (os.path.isfile(MC_VENV) and os.access(MC_VENV, os.X_OK)):
+        return {"argv0": None, "env": None, "mc": mc, "note": None, "error": NOT_BUILT}
+    env = None
+    m = _SYSAUDIO_DEFAULT.search(text)          # the sysaudio the wrapper would export
+    sysaudio = m.group(1).decode("utf-8", "replace") if m else ""
+    if not os.environ.get("MEETING_CAPTURE_SYSAUDIO") and sysaudio and os.path.isfile(sysaudio):
+        env = {**os.environ, "MEETING_CAPTURE_SYSAUDIO": sysaudio}
+    stamp = _stamp()
+    note = None
+    if version and stamp != version:
+        note = (f"meeting-capture {version} is installed, but the recorder still runs "
+                f"{stamp or 'an older version'} — run `meeting-capture install` between meetings")
+    return {"argv0": str(MC_VENV), "env": env, "mc": mc, "note": note, "error": None}
 
 
 def _tail(text: str, n: int = 200) -> str:
@@ -115,36 +194,65 @@ def _problem(data: Any) -> str | None:
     live = data.get("live")
     if (data.get("engine") not in ENGINES or not isinstance(data.get("ready"), bool)
             or not isinstance(data.get("uploads"), bool) or not isinstance(live, dict)
-            or not isinstance(live.get("active"), bool) or not isinstance(live.get("requested"), bool)):
-        return "`meeting-capture stt --json` lacks engine / ready / uploads / live"
+            or not isinstance(live.get("active"), bool) or not isinstance(live.get("requested"), bool)
+            or not isinstance(data.get("may_upload"), bool)):
+        return "`meeting-capture stt --json` lacks engine / ready / uploads / may_upload / live"
     return None
 
 
-def read(mc: str | None = None, timeout: float = READ_TIMEOUT_S) -> dict[str, Any]:
-    """Ask meeting-capture once: {"status": ok|old|error|missing, "mc", "data", "error"}."""
-    mc = mc or find_meeting_capture()
-    if not mc:
-        return {"status": "missing", "mc": None, "data": None, "error": "meeting-capture is not installed"}
+def _run(argv: list[str], timeout: float, env: dict | None) -> tuple[int, str, str]:
+    """Run argv in its own process group; on timeout kill the whole group
+    (whatever it started too) and raise subprocess.TimeoutExpired."""
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                         text=True, encoding="utf-8", errors="replace", env=env, start_new_session=True)
     try:
-        r = subprocess.run([mc, "stt", "--json"], capture_output=True, text=True, timeout=timeout,
-                           stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")
+        out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        return _failed(mc, f"`meeting-capture stt --json` timed out after {timeout:.0f}s")
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        p.communicate()
+        raise
+    return p.returncode, out, err
+
+
+def read(mc: str | None = None, timeout: float = READ_TIMEOUT_S, *,
+         via_wrapper: bool = False) -> dict[str, Any]:
+    """Ask meeting-capture once: {"status": ok|old|error|missing, "mc", "data",
+    "error", "note"}. Runs find_reader(mc) — never the brew wrapper — unless
+    via_wrapper (setup, in the foreground, where building the venv is fine)."""
+    reader = find_reader(mc)
+    if reader is None:
+        return {"status": "missing", "mc": None, "data": None, "error": "meeting-capture is not installed",
+                "note": None}
+    mc, note = reader["mc"], reader["note"]
+    argv0, env = (mc, None) if via_wrapper else (reader["argv0"], reader["env"])
+    if via_wrapper:
+        note = None                         # the wrapper brings the venv up to date first
+    if not argv0:
+        return {**_failed(mc, reader["error"]), "note": None}
+
+    def failed(why: str) -> dict[str, Any]:
+        return {**_failed(mc, why), "note": note}
+    try:
+        rc, out, err = _run([argv0, "stt", "--json"], timeout, env)
+    except subprocess.TimeoutExpired:
+        return failed(f"`meeting-capture stt --json` timed out after {timeout:.0f}s")
     except OSError as e:
-        return _failed(mc, f"can't run {mc}: {e.strerror or e}")
-    if r.returncode == 2:
+        return failed(f"can't run {argv0}: {e.strerror or e}")
+    if rc == 2:
         # argparse's usage error: no `stt` subcommand, or no --json. That is
         # meeting-capture < 0.7, which only transcribes with Gemini.
-        return {"status": "old", "mc": mc, "data": None, "error": None}
-    if r.returncode != 0:
-        return _failed(mc, f"`meeting-capture stt --json` failed (exit {r.returncode}): "
-                           f"{_tail(r.stderr) or 'no detail'}")
+        return {"status": "old", "mc": mc, "data": None, "error": None, "note": note}
+    if rc != 0:
+        return failed(f"`meeting-capture stt --json` failed (exit {rc}): {_tail(err) or 'no detail'}")
     try:
-        data = json.loads(r.stdout)
+        data = json.loads(out)
     except ValueError:
-        return _failed(mc, "`meeting-capture stt --json` printed something that isn't JSON")
+        return failed("`meeting-capture stt --json` printed something that isn't JSON")
     why = _problem(data)
-    return _failed(mc, why) if why else {"status": "ok", "mc": mc, "data": data, "error": None}
+    return failed(why) if why else {"status": "ok", "mc": mc, "data": data, "error": None, "note": note}
 
 
 def command(hint: str | None, mc: str) -> list[str] | None:
@@ -176,7 +284,9 @@ def _sig(path) -> tuple | None:
 
 
 def cache_key(mc: str) -> tuple:
-    return (_sig(PLIST), os.path.realpath(mc), _sig(mc), _sig(KEY_FILE))
+    run = (find_reader(mc) or {}).get("argv0") or mc
+    return (_sig(PLIST), os.path.realpath(mc), _sig(mc), os.path.realpath(run), _sig(run),
+            _sig(MC_STAMP), _sig(KEY_FILE))
 
 
 def _fresh(entry: tuple[float, dict] | None, ttl: float) -> bool:
@@ -222,21 +332,26 @@ def cached_read(wait: bool = True, ttl: float = TTL_S) -> dict[str, Any]:
     if start:
         def _bg() -> None:
             try:
-                res = read(mc, timeout=BACKGROUND_TIMEOUT_S)
+                res = read(mc)
             except Exception as e:  # noqa: BLE001 — never kill the thread silently
                 res = _failed(mc, f"{type(e).__name__}: {e}")
             _store(key, res)
         threading.Thread(target=_bg, name="stt-json", daemon=True).start()
     if hit:
         return hit[1]                       # stale, while the refresh runs
-    return {"status": "checking", "mc": mc, "data": None, "error": None}
+    return {"status": "checking", "mc": mc, "data": None, "error": None, "note": None}
 
 
 # ------------------------------------------------------------------ what to show
 
+FALLBACK_PRIVACY = "on this Mac — but if on-device transcription stops working, Gemini takes over (uploaded)"
+NEVER_PRIVACY = "meeting audio never leaves this Mac"
+
+
 def privacy(data: dict | None) -> str | None:
-    """Where meeting audio goes. Based only on the JSON's "uploads" and
-    "live.active"; None when that isn't known."""
+    """Where meeting audio goes. Based only on the JSON's "live.active",
+    "uploads" and "may_upload" (README "Contract"); None when that isn't
+    known. "never leaves this Mac" only when may_upload is false."""
     if not data:
         return None
     if data["live"]["active"]:
@@ -245,7 +360,19 @@ def privacy(data: dict | None) -> str | None:
         return "meeting audio is uploaded to Google Gemini for transcription"
     if data["engine"] == "none":
         return "nothing transcribes yet: recordings wait on this Mac"
-    return "meeting audio never leaves this Mac"
+    if data["may_upload"]:
+        return FALLBACK_PRIVACY
+    return NEVER_PRIVACY
+
+
+def privacy_fix(data: dict | None) -> str | None:
+    """How to make privacy() say "never leaves this Mac" when audio may leave
+    it only through auto's Gemini fallback (the JSON's on_device_only_hint);
+    None otherwise."""
+    if not data or not data["may_upload"] or data["uploads"] or data["live"]["active"]:
+        return None
+    hint = data.get("on_device_only_hint")
+    return f"`{hint}` never uploads" if hint else None
 
 
 def label(view: dict) -> str:
@@ -285,10 +412,15 @@ def view(reading: dict) -> dict[str, Any]:
         "engine": d["engine"] if d else ("gemini" if status == "old" else status),
         # nothing can transcribe: the menu's ⚠
         "attention": bool(d) and not d["ready"],
-        # audio leaves this Mac: True / False / None (unknown)
+        # audio leaves this Mac now: True / False / None (unknown)
         "leaves_mac": (d["uploads"] or d["live"]["active"]) if d else (True if status == "old" else None),
+        # ... or can, with nobody changing a setting (the JSON's may_upload)
+        "may_leave_mac": d["may_upload"] if d else (True if status == "old" else None),
         "privacy": privacy(d) if d else (
             "meeting audio is uploaded to Google Gemini for transcription" if status == "old" else None),
+        "privacy_fix": privacy_fix(d),
+        # the recorder runs an older meeting-capture than Homebrew installed
+        "note": reading.get("note"),
     }
     out["label"] = label(out)
     return out
@@ -302,10 +434,12 @@ def current(wait: bool = True, ttl: float = TTL_S) -> dict[str, Any]:
         return view(_failed(None, f"{type(e).__name__}: {e}"))
 
 
-def fresh(mc: str | None = None, timeout: float = READ_TIMEOUT_S) -> dict[str, Any]:
-    """view(read()) right now, bypassing the cache (setup, after a change)."""
+def fresh(mc: str | None = None, timeout: float = SETUP_READ_TIMEOUT_S) -> dict[str, Any]:
+    """view(read()) right now through `mc` itself — the brew wrapper too,
+    which may build the venv first — bypassing the cache. Setup only, in the
+    foreground."""
     try:
-        res = read(mc, timeout=timeout)
+        res = read(mc, timeout=timeout, via_wrapper=True)
     except Exception as e:  # noqa: BLE001
         res = _failed(mc, f"{type(e).__name__}: {e}")
     if res.get("mc"):

@@ -191,10 +191,8 @@ def _build_transcription_line(snap: st.Snapshot) -> rumps.MenuItem | None:
     t = snap.transcription or {}
     if not t.get("ok"):
         return None
-    text = f"Transcription: {t.get('label') or '?'}"
-    if t.get("attention"):
-        return rumps.MenuItem(f"⚠ {_truncate(text, 90)}")
-    return rumps.MenuItem(text)
+    text = _truncate(f"Transcription: {t.get('label') or '?'}", 90)   # an error label carries stderr
+    return rumps.MenuItem(f"⚠ {text}" if t.get("attention") else text)
 
 
 def _transcription_details(snap: st.Snapshot) -> list[str]:
@@ -218,7 +216,11 @@ def _transcription_details(snap: st.Snapshot) -> list[str]:
         elif live.get("requested"):
             lines.append(f"  live mode: runs batch — {_truncate(live.get('blocker') or '?', 60)}")
     if t.get("privacy"):
-        lines.append(f"  audio: {_truncate(t['privacy'], 70)}")
+        lines.append(f"  audio: {_truncate(t['privacy'], 100)}")
+    if t.get("privacy_fix"):
+        lines.append(f"  {_truncate(t['privacy_fix'], 70)}")
+    if t.get("note"):
+        lines.append(f"  ! {_truncate(t['note'], 100)}")
     return lines
 
 

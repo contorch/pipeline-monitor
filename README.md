@@ -25,11 +25,11 @@ End-to-end smoke test: inserts a marker doc → searches for it → deletes it. 
 
 ### Transcription engine
 
-meeting-capture transcribes on this Mac (Apple's on-device speech model: macOS 26+ on Apple silicon, no key, audio never leaves the Mac) or with Gemini (optional; needs a key). `meeting-capture stt auto|apple|gemini` and `meeting-capture language LOCALE` set it. `contorch setup` offers Gemini only as an optional upgrade when on-device works, and asks for a key only when it doesn't. It applies the choice by running those meeting-capture commands (their progress, a model download included, streams into setup's output), then asks again before it says where the audio goes. `contorch status` and `contorch doctor` show the engine, the language and where audio goes.
+meeting-capture transcribes on this Mac (Apple's on-device speech model: macOS 26+ on Apple silicon, no key, audio never leaves the Mac) or with Gemini (optional; needs a key). `meeting-capture stt auto|apple|gemini` and `meeting-capture language LOCALE` set it. `contorch setup` offers Gemini only as an optional upgrade when on-device works, and asks for a key only when it doesn't. With a key the recorder can see, it offers “on this Mac only” (`stt apple`, never uploads) apart from “on this Mac, Gemini as backup” (`stt auto`, which uploads a chunk if on-device transcription stops working). It applies the choice by running those meeting-capture commands (their progress, a model download included, streams into setup's output), then asks again before it says where the audio goes. `contorch status` and `contorch doctor` show the engine, the language and where audio goes.
 
 Live mode (`meeting-capture mode live`, or the menu's capture-mode toggle) streams every call to Gemini as it happens, whatever the engine is. While it does, the menu bar's Transcription line, Details, `contorch status`/`doctor` add “live: calls stream to Gemini”, and `contorch setup` says so instead of “the audio never leaves this Mac”.
 
-pipeline-monitor has no rules of its own for any of this. It asks meeting-capture (see [Contract](#contract)) and shows the answer. The menu bar asks on a background thread and caches the answer per (the agent's plist, the meeting-capture executable, the key file) for 10 minutes; a failed read is retried after a minute. A `meeting-capture stt|language|mode` change or a `brew upgrade` therefore shows up on the next refresh. See `pipeline_monitor/transcription.py`. If meeting-capture is missing, the line is left out. A meeting-capture older than 0.7 (no `stt --json`) shows as “Gemini (meeting-capture < 0.7 — upgrade for on-device)”. An answer that can't be read shows as “unknown”. Neither fallback ever claims on-device transcription.
+pipeline-monitor has no rules of its own for any of this. It asks meeting-capture (see [Contract](#contract)) and shows the answer. The menu bar asks on a background thread and caches the answer per (the agent's plist, the meeting-capture executable and its venv's version stamp, the key file) for 10 minutes; a failed read is retried after a minute. A `meeting-capture stt|language|mode` change or a `brew upgrade` therefore shows up on the next refresh. A read never runs Homebrew's wrapper (see [Contract](#contract)): after a `brew upgrade` it reads the venv the recorder still runs and adds “run `meeting-capture install` between meetings”. See `pipeline_monitor/transcription.py`. If meeting-capture is missing, the line is left out. A meeting-capture older than 0.7 (no `stt --json`) shows as “Gemini (meeting-capture < 0.7 — upgrade for on-device)”. An answer that can't be read shows as “unknown”. Neither fallback ever claims on-device transcription.
 
 ## Contract
 
@@ -37,13 +37,13 @@ pipeline-monitor has no rules of its own for any of this. It asks meeting-captur
 
 - `engine` (`apple` | `gemini` | `none`), `ready` and `reason`
 - `locale`, `locale_why` and `locale_guessed`
-- `uploads` and `live.{requested, active, blocker}`
+- `uploads`, `live.{requested, active, blocker}` and `may_upload`
 - `gemini_key` and `gemini_fallback`
 - `apple.{usable, installable, reason, installed_locales, helper}`
 - `needs_model` and `install_hint`
-- `on_device_hint`, `choice` and `notice`
+- `on_device_hint`, `on_device_only_hint`, `choice` and `notice`
 
-Where audio goes is worded only from `uploads` and `live.active` (`transcription.privacy()`). A usage error (exit 2) means meeting-capture < 0.7. Setup changes things only through meeting-capture's own commands: `meeting-capture stt gemini`, or the JSON's `on_device_hint` / `install_hint` (`meeting-capture language L`, `meeting-capture stt auto [--language L]`). Those commands print progress lines on stdout, never prompt, and exit 0 when applied (1 when refused).
+Where audio goes is worded only from `live.active`, `uploads` and `may_upload` (`transcription.privacy()`): “never leaves this Mac” only when `may_upload` is false. `may_upload` is also true for `auto` with a key while on-device runs (`gemini_fallback`), because meeting-capture then sends a chunk to Gemini by itself when on-device transcription fails; that case reads “on this Mac — but if on-device transcription stops working, Gemini takes over (uploaded)”, plus the JSON's `on_device_only_hint` (`meeting-capture stt apple` never uploads). A usage error (exit 2) means meeting-capture < 0.7. Reads run the venv's own `~/.meeting-capture/venv/bin/meeting-capture` (what the recorder runs), never the Homebrew wrapper, which after a `brew upgrade` deletes and rebuilds that venv under the running recorder; only `contorch setup`, in the foreground, goes through the wrapper. Setup changes things only through meeting-capture's own commands: `meeting-capture stt gemini`, or the JSON's `on_device_only_hint` (“on this Mac only”: `meeting-capture stt apple`), `on_device_hint` (“on this Mac, Gemini as backup”: `meeting-capture language L`, `meeting-capture stt auto [--language L]`). Those commands print progress lines on stdout, never prompt, and exit 0 when applied (1 when refused).
 
 ## Install
 

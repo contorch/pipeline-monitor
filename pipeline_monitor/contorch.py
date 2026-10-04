@@ -20,6 +20,7 @@ import getpass
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -464,19 +465,35 @@ def _choose_transcription(log, todo: list, mc: str) -> list[str] | None:
     if d["live"]["active"]:
         log("    But live mode is on, and it streams every call to Google Gemini whichever")
         log("    engine you pick here.")
+    # With a key the recorder can see, "on this Mac" is two settings: only
+    # (`stt apple`, never uploads) or with Gemini as backup (`stt auto`: when
+    # on-device fails, meeting-capture sends the chunk to Gemini by itself).
+    # Without one they upload the same (never), so it's one choice that keeps
+    # whichever is set. The commands are the JSON's own hints.
+    key = bool(d.get("gemini_key"))
+    only = "mac_only" if key or d.get("choice") == "apple" else "mac"
     # Default: what transcribes now — unless Gemini is only standing in until
     # the on-device model arrives (needs_model), then this Mac.
-    gemini_now = d.get("choice") == "gemini" or (d["engine"] == "gemini" and not d.get("needs_model"))
-    want = "gemini" if gemini_now else "mac"
+    if d.get("choice") == "gemini" or (d["engine"] == "gemini" and not d.get("needs_model")):
+        want = "gemini"
+    else:
+        want = "mac_only" if d.get("choice") == "apple" else "mac"
     if _interactive():
         log("")
         for line in STT_UPGRADE:
             log("  " + line)
-        default = "2" if want == "gemini" else "1"
-        log(f"    1. On this Mac ({loc}){'  (default)' if default == '1' else ''}")
-        log(f"    2. Gemini — needs a free API key{'  (default)' if default == '2' else ''}")
-        ans = input("  Choose 1-2 (Enter for default): ").strip() or default
-        want = "gemini" if ans == "2" else "mac"
+        if key:
+            options = [("mac_only", f"On this Mac only ({loc}) — never uploads"),
+                       ("mac", f"On this Mac ({loc}), Gemini as backup — uploads only if on-device "
+                               "transcription stops working"),
+                       ("gemini", "Gemini — meeting audio is uploaded to Google")]
+        else:
+            options = [(only, f"On this Mac ({loc})"), ("gemini", "Gemini — needs a free API key")]
+        default = next((str(i) for i, (w, _) in enumerate(options, 1) if w == want), "1")
+        for i, (_, text) in enumerate(options, 1):
+            log(f"    {i}. {text}{'  (default)' if str(i) == default else ''}")
+        ans = input(f"  Choose 1-{len(options)} (Enter for default): ").strip() or default
+        want = dict((str(i), w) for i, (w, _) in enumerate(options, 1)).get(ans, options[int(default) - 1][0])
     if want == "gemini":
         if _recorder_key(log) or (_interactive() and _key_out_of_reach() is None and _ask_for_key(log)):
             # Already Gemini, and staying so (not just until a missing on-device
@@ -492,7 +509,8 @@ def _choose_transcription(log, todo: list, mc: str) -> list[str] | None:
                         f"or transcribe on this Mac: {fix}")
             return None
         log("  · no key the recorder can use — transcription stays on this Mac")
-    return stt.command(d.get("on_device_hint"), mc)
+        want = "mac_only" if d.get("choice") == "apple" else "mac"
+    return stt.command(d.get("on_device_only_hint" if want == "mac_only" else "on_device_hint"), mc)
 
 
 def _apply_stt(cmd: list[str] | None, log, todo: list) -> None:
@@ -505,12 +523,20 @@ def _apply_stt(cmd: list[str] | None, log, todo: list) -> None:
     log(f"  $ {shown}")
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                text=True, encoding="utf-8", errors="replace")
+                                text=True, encoding="utf-8", errors="replace", start_new_session=True)
     except OSError as e:
         log(f"  ✗ could not run it: {e.strerror or e}")
         todo.append(f"Set up transcription: {shown}")
         return
-    killer = threading.Timer(APPLY_TIMEOUT_S, proc.kill)
+    timed_out = threading.Event()
+
+    def _kill() -> None:
+        timed_out.set()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)     # and the helper's model download it started
+        except OSError:
+            pass
+    killer = threading.Timer(APPLY_TIMEOUT_S, _kill)
     killer.start()
     try:
         for line in proc.stdout:
@@ -518,7 +544,11 @@ def _apply_stt(cmd: list[str] | None, log, todo: list) -> None:
         rc = proc.wait()
     finally:
         killer.cancel()
-    if rc != 0:
+    if timed_out.is_set():
+        log(f"  ✗ `{shown}` timed out after {APPLY_TIMEOUT_S // 60} min and was stopped — "
+            "check with: meeting-capture stt")
+        todo.append(f"Set up transcription (it timed out): {shown}")
+    elif rc != 0:
         log(f"  ✗ `{shown}` failed (exit {rc})")
         todo.append(f"Set up transcription: {shown}")
 
@@ -527,7 +557,7 @@ def _report_transcription(mc: str, log, todo: list, done: list) -> None:
     """How meetings will be transcribed and where the audio goes, from
     meeting-capture's answer once setup has changed what it changes. The one
     place setup says so; the wording comes from transcription.privacy() (the
-    JSON's "uploads" and "live.active")."""
+    JSON's "live.active", "uploads" and "may_upload")."""
     t = stt.fresh(mc)
     if t["status"] not in ("ok", "old"):
         log(f"  ✗ couldn't ask meeting-capture how it transcribes: {t['error']}")
@@ -536,17 +566,18 @@ def _report_transcription(mc: str, log, todo: list, done: list) -> None:
     d = t["data"] or {}
     log(f"  {'✗' if t['attention'] else '✓'} transcription: {t['label']}")
     if t["privacy"]:
-        tail = ("; transcripts and the search index stay here too." if not t["leaves_mac"]
+        tail = ("; transcripts and the search index stay here too." if t["may_leave_mac"] is False
                 else "; transcripts and the search index stay on this Mac.")
         log(f"    {t['privacy'][0].upper()}{t['privacy'][1:]}{tail}")
+    if t["privacy_fix"]:
+        log(f"    ({t['privacy_fix']}.)")
     live = d.get("live") or {}
     if live.get("active") and (d.get("apple") or {}).get("usable"):
         log(f"    {LIVE_KEEP_LOCAL}")
     elif live.get("requested") and not live.get("active"):
         log(f"    · Live mode is requested, but the recorder records in batch: {live.get('blocker')}.")
-    if d.get("gemini_fallback") and not live.get("active"):
-        log("    (You have a Gemini key, so if on-device speech ever stops working, Gemini")
-        log("     takes over; `meeting-capture stt apple` keeps audio on this Mac always.)")
+    if t["note"]:
+        log(f"    ! {t['note']}")
     if t["status"] == "old":
         log("    Upgrade for on-device transcription: brew upgrade meeting-capture")
         if not _key_file_has_key():
@@ -757,7 +788,9 @@ def _print_transcription_detail() -> int:
         if d.get("notice"):
             print(f"    note: {d['notice']}")
     if t["privacy"]:
-        print(f"    audio: {t['privacy']}")
+        print(f"    audio: {t['privacy']}" + (f" ({t['privacy_fix']})" if t["privacy_fix"] else ""))
+    if t["note"]:
+        print(f"    ! {t['note']}")
     if d:
         print("    change it: meeting-capture stt auto|apple|gemini · meeting-capture language LOCALE"
               " · meeting-capture mode batch|live")
@@ -805,6 +838,10 @@ def _print_status(transcription: bool = True) -> int:
         d = t["data"]
         print(f"\n  {'transcription':<24} {t['label']}"
               + (f"  [setting: {d['choice']}, locale {d['locale']}]" if d else ""))
+        if t["privacy"]:
+            print(f"  {'':<24} audio: {t['privacy']}" + (f" ({t['privacy_fix']})" if t["privacy_fix"] else ""))
+        if t["note"]:
+            print(f"  {'':<24} ! {t['note']}")
     return 0
 
 

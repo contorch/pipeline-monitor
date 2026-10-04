@@ -181,6 +181,8 @@ def test_menu_transcription_line():
     assert title(stt.view({"status": "old", "mc": "/x/mc"})) == \
         "Transcription: Gemini (meeting-capture < 0.7 — upgrade for on-device)"
     assert title(stt.view({"status": "error", "mc": "/x/mc", "error": "boom"})) == "Transcription: unknown — boom"
+    long = stt.view({"status": "error", "mc": "/x/mc", "error": "failed (exit 1): " + "x" * 200})
+    assert len(title(long)) == 90 and title(long).endswith("…")      # stderr never widens the menu
 
 
 def test_menu_transcription_line_hidden_without_meeting_capture():
@@ -200,6 +202,13 @@ def test_menu_details_come_from_meeting_captures_answer():
     assert lines[0] == "Transcription: on this Mac (en-US)"
     assert "setting: auto · locale en-US" in lines[1]
     assert lines[2].strip() == "on-device: ready" and "Gemini key: yes" in lines[3]
+    # auto + a key: Gemini takes over when on-device fails — never "never leaves"
+    assert lines[-2].strip() == ("audio: on this Mac — but if on-device transcription stops working, "
+                                 "Gemini takes over (uploaded)")
+    assert lines[-1].strip() == "`meeting-capture stt apple` never uploads"
+    assert not any("never leaves" in l for l in lines)
+    lines = app._transcription_details(app.st.Snapshot(transcription=_view(choice="apple",
+                                                                           on_device_only_hint=None)))
     assert lines[-1].strip() == "audio: meeting audio never leaves this Mac"
     titles = [i.title for i in app._build_details_submenu(snap).values() if hasattr(i, "title")]
     assert "Transcription: on this Mac (en-US)" in titles

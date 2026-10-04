@@ -21,6 +21,7 @@ def _isolate_transcription(tmp_path, monkeypatch):
     monkeypatch.setattr(stt, "KEY_FILE", tmp_path / "no-key")
     monkeypatch.setattr(stt, "MC_CANDIDATES", ())
     monkeypatch.setattr(stt, "MC_VENV", tmp_path / "no-venv" / "meeting-capture")
+    monkeypatch.setattr(stt, "MC_STAMP", tmp_path / "no-venv" / ".formula-version")
     monkeypatch.setattr(stt, "_which", lambda name: None)
     # Setup reads keys from this shell, so none of the developer's may leak in.
     for v in [k for k in os.environ if k.startswith("MEETING_CAPTURE_")] + [
@@ -58,8 +59,11 @@ def mc_json(**over) -> dict:
          "locale_guessed": False, "mac_language": "en-US",
          "uploads": False, "gemini_fallback": False, "gemini_key": False, "notice": None,
          "needs_model": False, "install_hint": None, "on_device_hint": None,
+         "on_device_only_hint": "meeting-capture stt apple",
          "apple": apple, "live": live}
     d.update(over)
+    if "may_upload" not in over:        # what meeting-capture computes (its README "Contract")
+        d["may_upload"] = bool(d["uploads"] or d["live"]["active"] or d["gemini_fallback"])
     return d
 
 
@@ -88,12 +92,18 @@ UNAVAILABLE = dict(engine="none", engine_label="None", ready=False,
 
 FAKE_MC = r'''#!{python}
 import json, os, sys, time
-here = os.path.dirname(os.path.abspath(__file__))
+here = os.path.dirname(os.path.realpath(__file__))
 state_path = os.path.join(here, "mc-state.json")
 state = json.load(open(state_path))
 args = sys.argv[1:]
 with open(os.path.join(here, "mc-calls.jsonl"), "a") as f:
     f.write(json.dumps(args) + "\n")
+with open(os.path.join(here, "mc-env.json"), "w") as f:
+    json.dump({"MEETING_CAPTURE_SYSAUDIO": os.environ.get("MEETING_CAPTURE_SYSAUDIO")}, f)
+if state.get("spawn"):           # a grandchild (pip, the helper's download) that outlives a plain kill
+    import subprocess
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    open(os.path.join(here, "grandchild.pid"), "w").write(str(child.pid))
 if args == ["stt", "--json"]:
     mode = state.get("mode", "ok")
     time.sleep(state.get("sleep", 0))
@@ -112,6 +122,7 @@ if args == ["stt", "--json"]:
 key = " ".join(args)
 for line in state.get("lines", {}).get(key, []):
     print(line, flush=True)
+time.sleep(state.get("cmd_sleep", {}).get(key, 0))
 if key in state.get("after", {}):
     state["json"] = state["after"][key]
     json.dump(state, open(state_path, "w"))

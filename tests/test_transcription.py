@@ -3,7 +3,9 @@
 meeting-capture that prints canned answers; nothing real is run."""
 from __future__ import annotations
 
+import json
 import os
+import sys
 import time
 
 import pytest
@@ -85,18 +87,36 @@ def test_nothing_can_transcribe_needs_attention(fake_mc, over):
     assert v["attention"] is True and v["label"] == f"unavailable — {over['reason']}"
 
 
-@pytest.mark.parametrize("uploads,active,leaves,words", [
-    (False, False, False, "never leaves this Mac"),
-    (True, False, True, "uploaded to Google Gemini"),
-    (False, True, True, "streams to Google Gemini"),
-    (True, True, True, "streams to Google Gemini"),
+@pytest.mark.parametrize("uploads,active,may,leaves,words", [
+    (False, False, False, False, "never leaves this Mac"),
+    (False, False, True, False, "Gemini takes over (uploaded)"),
+    (True, False, True, True, "uploaded to Google Gemini"),
+    (False, True, True, True, "streams to Google Gemini"),
+    (True, True, True, True, "streams to Google Gemini"),
 ])
-def test_privacy_comes_only_from_uploads_and_live_active(fake_mc, uploads, active, leaves, words):
-    # An engine that contradicts the flags doesn't change the wording: only the two flags do.
-    fake_mc.set(json=mc_json(engine="gemini" if not uploads else "apple", uploads=uploads,
-                             live={"requested": active, "active": active}))
+def test_privacy_comes_only_from_uploads_live_active_and_may_upload(fake_mc, uploads, active, may, leaves,
+                                                                      words):
+    # An engine or fallback flag that contradicts these fields doesn't change the wording.
+    fake_mc.set(json=mc_json(engine="gemini" if not uploads else "apple", uploads=uploads, may_upload=may,
+                             gemini_fallback=not may, live={"requested": active, "active": active}))
     v = stt.current()
-    assert v["leaves_mac"] is leaves and words in v["privacy"]
+    assert v["leaves_mac"] is leaves and v["may_leave_mac"] is may and words in v["privacy"]
+    assert ("never leaves" in v["privacy"]) is (not may)
+
+
+def test_auto_with_a_key_may_upload_and_is_never_called_never_leaves(fake_mc):
+    """The review's blocker: stt unset/auto, a key the recorder sees, on-device
+    ready, batch. Nothing uploads now, but meeting-capture hands a chunk to
+    Gemini by itself when on-device fails (gemini_fallback, may_upload)."""
+    fake_mc.set(json=mc_json(gemini_key=True, gemini_fallback=True))
+    v = stt.current()
+    assert v["label"] == "on this Mac (en-US)" and v["leaves_mac"] is False and v["may_leave_mac"] is True
+    assert v["privacy"] == stt.FALLBACK_PRIVACY and "never leaves" not in v["privacy"]
+    assert v["privacy_fix"] == "`meeting-capture stt apple` never uploads"
+    fake_mc.set(json=mc_json(choice="apple", gemini_key=True, on_device_only_hint=None))
+    stt.clear_cache()
+    v = stt.current()
+    assert v["privacy"] == stt.NEVER_PRIVACY and v["may_leave_mac"] is False and v["privacy_fix"] is None
 
 
 def test_an_old_meeting_capture_is_gemini_and_never_on_device(fake_mc):
@@ -118,6 +138,7 @@ def test_unreadable_answers_are_unknown_and_claim_nothing(fake_mc, mode, why):
 @pytest.mark.parametrize("answer,why", [
     (mc_json(schema=2), "schema 2"),
     ({k: v for k, v in mc_json().items() if k != "uploads"}, "lacks"),
+    ({k: v for k, v in mc_json().items() if k != "may_upload"}, "lacks"),
     (mc_json(engine="whisper"), "lacks"),
     (mc_json(live={"active": "yes"}), "lacks"),
     ([1, 2], "JSON object"),
@@ -132,6 +153,24 @@ def test_a_timeout_is_unknown(fake_mc):
     fake_mc.set(sleep=3)
     r = stt.read(timeout=0.5)
     assert r["status"] == "error" and "timed out" in r["error"]
+
+
+def test_a_timeout_kills_what_meeting_capture_started(fake_mc):
+    fake_mc.set(sleep=30, spawn=True)
+    t0 = time.monotonic()
+    r = stt.read(timeout=1.0)
+    assert r["status"] == "error" and "timed out" in r["error"] and time.monotonic() - t0 < 10
+    pid = int((fake_mc.root / "grandchild.pid").read_text())
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(pid, 9)
+        pytest.fail("the grandchild outlived the timeout")
 
 
 def test_without_meeting_capture():
@@ -207,3 +246,110 @@ def test_fresh_bypasses_the_cache(fake_mc):
     assert stt.current()["engine"] == "apple"                # cached
     assert stt.fresh()["engine"] == "gemini"
     assert stt.current()["engine"] == "gemini"               # and refreshed it
+
+
+# ------------------------------------------------------------ the Homebrew wrapper is never run by a read
+
+WRAPPER = """#!/bin/bash
+set -e
+VENV="${{MEETING_CAPTURE_VENV:-$HOME/.meeting-capture/venv}}"
+STAMP="$VENV/.formula-version"
+echo ran >> "{marker}"
+if ! "$VENV/bin/python" -c "" 2>/dev/null || [ "$(cat "$STAMP" 2>/dev/null)" != "{version}" ]; then
+  echo "meeting-capture: setting up environment (first run / upgrade)..." >&2
+  exit 1
+fi
+export MEETING_CAPTURE_SYSAUDIO="${{MEETING_CAPTURE_SYSAUDIO:-{sysaudio}}}"
+exec "{venv_mc}" "$@"
+"""
+
+
+@pytest.fixture
+def brew(tmp_path, monkeypatch, fake_mc):
+    """Homebrew's layout: opt/bin/meeting-capture is the formula's bash wrapper
+    (a run after an upgrade would rm -rf and rebuild the venv; this one only
+    leaves a marker), and the venv's own meeting-capture is the fake."""
+    opt = tmp_path / "opt" / "bin"
+    opt.mkdir(parents=True)
+    (opt / "sysaudio").write_text("")
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    os.symlink(fake_mc.path, venv / "bin" / "meeting-capture")
+    os.symlink(sys.executable, venv / "bin" / "python")
+    monkeypatch.setenv("MEETING_CAPTURE_VENV", str(venv))
+    stamp = venv / ".formula-version"
+    stamp.write_text("0.7.0\n")
+    marker = tmp_path / "wrapper-ran"
+    wrapper = opt / "meeting-capture"
+    wrapper.write_text(WRAPPER.format(marker=marker, version="0.7.0", sysaudio=opt / "sysaudio",
+                                      venv_mc=venv / "bin" / "meeting-capture"))
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(stt, "MC_CANDIDATES", (str(wrapper),))
+    monkeypatch.setattr(stt, "MC_VENV", venv / "bin" / "meeting-capture")
+    monkeypatch.setattr(stt, "MC_STAMP", stamp)
+    monkeypatch.delenv("MEETING_CAPTURE_SYSAUDIO", raising=False)
+
+    class B:
+        pass
+    b = B()
+    b.wrapper, b.venv, b.stamp, b.marker, b.sysaudio = wrapper, venv, stamp, marker, opt / "sysaudio"
+    b.ran = lambda: marker.exists()
+    return b
+
+
+def _wait_answer():
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        v = stt.current(wait=False)
+        if v["status"] != "checking":
+            return v
+        time.sleep(0.05)
+    pytest.fail("no answer")
+
+
+def test_reads_run_the_venv_never_the_wrapper(brew, fake_mc):
+    assert stt.wrapper_version(str(brew.wrapper)) == "0.7.0"
+    assert stt.wrapper_version(str(fake_mc.path)) is None
+    v = _wait_answer()                                       # the menu bar's background read
+    assert v["label"] == "on this Mac (en-US)" and v["note"] is None
+    stt.clear_cache()
+    assert stt.current(wait=True)["status"] == "ok"          # contorch status / doctor
+    assert not brew.ran() and fake_mc.reads() == 2
+    # with the sysaudio the wrapper would have exported
+    env = json.loads((fake_mc.root / "mc-env.json").read_text())
+    assert env["MEETING_CAPTURE_SYSAUDIO"] == str(brew.sysaudio)
+
+
+def test_after_brew_upgrade_reads_the_venv_and_says_so(brew, fake_mc):
+    """The review's major: the wrapper's version no longer matches the venv's
+    stamp. A read must not start the rebuild (rm -rf of the venv the
+    recorder runs from); it reads what the recorder still runs and notes it."""
+    brew.wrapper.write_text(brew.wrapper.read_text().replace('"0.7.0"', '"0.8.0"'))
+    for wait in (False, True):
+        stt.clear_cache()
+        v = _wait_answer() if not wait else stt.current(wait=True)
+        assert v["status"] == "ok" and not brew.ran()
+        assert v["note"] == ("meeting-capture 0.8.0 is installed, but the recorder still runs 0.7.0 — "
+                             "run `meeting-capture install` between meetings")
+    brew.stamp.write_text("0.8.0\n")                         # the user rebuilt it: re-read at once
+    assert stt.current(wait=True)["note"] is None and fake_mc.reads() == 3
+
+
+def test_an_unbuilt_venv_is_not_built_by_a_read(brew, fake_mc):
+    (brew.venv / "bin" / "meeting-capture").unlink()
+    for v in (stt.current(wait=True), _wait_answer()):
+        assert v["status"] == "error" and v["error"] == stt.NOT_BUILT and v["privacy"] is None
+    assert not brew.ran() and fake_mc.reads() == 0
+
+
+def test_setup_reads_through_the_wrapper(brew, fake_mc):
+    v = stt.fresh(str(brew.wrapper))
+    assert v["status"] == "ok" and brew.ran()
+
+
+def test_a_read_after_a_rebuild_is_fresh(brew, fake_mc):
+    stt.current()
+    st = brew.stamp.stat()
+    os.utime(brew.stamp, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+    stt.current()
+    assert fake_mc.reads() == 2

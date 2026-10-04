@@ -114,11 +114,14 @@ def test_gemini_chosen_before_is_the_default_and_on_device_uses_meeting_captures
     _key_file()
     term = Answers(monkeypatch, inputs=[""])
     cmd, out, todo = _choose(fake_mc)                         # Enter keeps Gemini
-    assert cmd is None and todo == [] and "2. Gemini — needs a free API key  (default)" in out
+    assert cmd is None and todo == [] and "3. Gemini — meeting audio is uploaded to Google  (default)" in out
     assert term.key_prompts == 0
-    Answers(monkeypatch, inputs=["1"])
-    cmd, out, todo = _choose(fake_mc)                         # back to this Mac
+    Answers(monkeypatch, inputs=["2"])
+    cmd, out, todo = _choose(fake_mc)                         # back to this Mac, Gemini as backup
     assert cmd == [str(fake_mc.path), "stt", "auto"]
+    Answers(monkeypatch, inputs=["1"])
+    cmd, out, todo = _choose(fake_mc)                         # this Mac only
+    assert cmd == [str(fake_mc.path), "stt", "apple"]
 
 
 def test_a_missing_model_is_set_up_with_meeting_captures_install_hint(fake_mc, monkeypatch, env):
@@ -137,6 +140,28 @@ def test_a_missing_model_is_set_up_with_meeting_captures_install_hint(fake_mc, m
     assert "      en-US model download 50%" in log                # meeting-capture's lines, as they come
     out, todo, done = _report(fake_mc)
     assert done == ["Transcription: on this Mac (en-US)"] and "never leaves this Mac" in out
+
+
+def test_a_change_that_hangs_is_stopped_and_says_it_timed_out(fake_mc, monkeypatch, env):
+    fake_mc.set(lines={"language hi-IN": ["Downloading the on-device speech model for hi-IN…"]},
+                cmd_sleep={"language hi-IN": 30}, spawn=True)
+    monkeypatch.setattr(ct, "APPLY_TIMEOUT_S", 1)
+    log, todo = [], []
+    ct._apply_stt([str(fake_mc.path), "language", "hi-IN"], log.append, todo)
+    assert any("timed out after" in l and "meeting-capture stt" in l for l in log)
+    assert todo == ["Set up transcription (it timed out): meeting-capture language hi-IN"]
+    pid = int((fake_mc.root / "grandchild.pid").read_text())
+    import os
+    import time
+    for _ in range(100):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(pid, 9)
+        pytest.fail("the download it started outlived the timeout")
 
 
 def test_a_failed_change_is_a_todo(fake_mc, env):
@@ -168,17 +193,47 @@ def test_dutch_mac_with_a_key_keeps_gemini_and_says_audio_is_uploaded(fake_mc, m
     assert fake_mc.changes() == []
 
 
-def test_dutch_mac_choosing_on_device_runs_the_hint(fake_mc, monkeypatch, env):
+def test_dutch_mac_choosing_on_device_with_gemini_as_backup_runs_the_hint(fake_mc, monkeypatch, env):
+    """Gemini stays the backup (auto + a key): the report says audio stays on
+    this Mac unless on-device stops working — never "never leaves"."""
     fake_mc.set(json=mc_json(**DUTCH), after={"language en-US": mc_json(locale_source="setting",
                                                                         gemini_key=True, gemini_fallback=True)})
     _key_file()
-    Answers(monkeypatch, inputs=["1"])
+    Answers(monkeypatch, inputs=["2"])
     cmd, out, todo = _choose(fake_mc)
     assert cmd == [str(fake_mc.path), "language", "en-US"]
     ct._apply_stt(cmd, lambda _: None, [])
     out, todo, done = _report(fake_mc)
-    assert "Meeting audio never leaves this Mac" in out and "Gemini" in out and "takes over" in out
+    assert "never leaves" not in out
+    assert ("On this Mac — but if on-device transcription stops working, Gemini takes over (uploaded); "
+            "transcripts and the search index stay on this Mac.") in out
+    assert "(`meeting-capture stt apple` never uploads.)" in out
     assert done == ["Transcription: on this Mac (en-US)"]
+
+
+def test_on_this_mac_only_with_a_key_runs_stt_apple_and_never_uploads(fake_mc, monkeypatch, env):
+    """The review's case: English Mac, key in the file, stt unset. "On this
+    Mac only" must drop auto's Gemini fallback (`stt apple`), and only then
+    does the report say "never leaves this Mac"."""
+    fake_mc.set(json=mc_json(choice="auto", gemini_key=True, gemini_fallback=True),
+                after={"stt apple": mc_json(choice="apple", gemini_key=True, on_device_only_hint=None)})
+    _key_file()
+    for interactive, answer, want in ((True, "", None), (False, "", None), (True, "1", "apple")):
+        monkeypatch.setattr(ct, "_interactive", lambda: interactive)
+        Answers(monkeypatch, inputs=[answer])
+        cmd, out, todo = _choose(fake_mc)
+        if want is None:                          # the default keeps what is set (auto)…
+            assert cmd is None
+            out, _, _ = _report(fake_mc)          # …and says so honestly
+            assert "never leaves" not in out and "Gemini takes over (uploaded)" in out
+            continue
+        assert "1. On this Mac only (en-US) — never uploads" in out
+        assert "2. On this Mac (en-US), Gemini as backup" in out and "(default)" in out.split("2. On")[1]
+        assert cmd == [str(fake_mc.path), "stt", "apple"]
+        ct._apply_stt(cmd, lambda _: None, [])
+        out, todo, done = _report(fake_mc)
+        assert "Meeting audio never leaves this Mac; transcripts and the search index stay here too." in out
+        assert "takes over" not in out and "never uploads.)" not in out
 
 
 # ------------------------------------------------------------ live mode
@@ -421,6 +476,19 @@ def test_status_and_doctor_show_meeting_captures_answer(agent, capsys):
     assert rc == 0 and "✓ on this Mac (en-GB)" in out and "installed speech models: en-GB, en-US" in out
     assert "audio: meeting audio never leaves this Mac" in out
     assert agent.reads() == 1                                        # status and doctor share the answer
+
+
+def test_status_and_doctor_hedge_auto_with_a_key(agent, capsys):
+    """The review's blocker in status/doctor: auto + a key + on-device ready."""
+    agent.set(json=mc_json(gemini_key=True, gemini_fallback=True))
+    assert ct.main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "never leaves" not in out and "Gemini takes over (uploaded)" in out
+    assert "`meeting-capture stt apple` never uploads" in out
+    rc, out = _doctor(capsys)
+    assert rc == 0 and "never leaves" not in out
+    assert ("audio: on this Mac — but if on-device transcription stops working, Gemini takes over "
+            "(uploaded) (`meeting-capture stt apple` never uploads)") in out
 
 
 def test_doctor_on_a_dutch_mac_says_uploaded(agent, capsys):

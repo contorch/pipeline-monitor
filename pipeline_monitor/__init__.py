@@ -1,2 +1,2 @@
 """Pipeline monitor — menu bar dashboard for meeting-capture + context-orchestrator."""
-__version__ = "0.3.0"
+__version__ = "0.4.0"

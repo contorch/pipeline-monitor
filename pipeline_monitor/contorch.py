@@ -696,7 +696,8 @@ def _memory_only_embeddings(log, todo: list, done: list, choice: str | None) -> 
     if choice is None:
         _setup_embeddings(log, todo, done)
         return
-    modules.set_embeddings_source(choice if choice in modules.EMBEDDINGS_SOURCES else "local")
+    if choice in modules.EMBEDDINGS_SOURCES:
+        modules.set_embeddings_source(choice)
     _setup_embeddings(log, todo, done, choice="gemini" if choice == "imported" else choice)
     if choice == "imported" and not _have_key():
         log("    Without a Gemini key on this Mac, search uses keywords (the imported vectors need the "

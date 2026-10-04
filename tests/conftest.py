@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from pipeline_monitor import mcconfig, owners
+from pipeline_monitor import mcconfig, owners, ownerstate
 from pipeline_monitor import transcription as stt
 
 
@@ -55,6 +55,14 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(owners, "USER_VENVS", {k: tmp_path / "venvs" / k for k in owners.USER_VENVS})
     monkeypatch.setattr(mcconfig, "LEGACY_PLIST", tmp_path / "no-agent.plist")
     mcconfig.clear_cache()
+    ownerstate.clear()
+    # contorch's own launchd view: a scratch LaunchAgents and a launchctl
+    # that knows no job (tests that need one replace it)
+    from pipeline_monitor import contorch as ct
+    monkeypatch.setattr(ct, "LAUNCH_AGENTS", tmp_path / "LaunchAgents")
+    monkeypatch.setattr(ct, "STATE_DIR", home / ".contorch")
+    monkeypatch.setattr(ct, "STOPPED_MARKER", home / ".contorch" / "stopped.json")
+    monkeypatch.setattr(ct, "_launchctl", lambda *a: subprocess.CompletedProcess(a, 113, "", "not found"))
     monkeypatch.setattr(stt, "PLIST", tmp_path / "no-agent.plist")
     monkeypatch.setattr(stt, "KEY_FILE", tmp_path / "no-key")
     monkeypatch.setattr(stt, "MC_VENV", tmp_path / "no-venv" / "meeting-capture")
@@ -67,6 +75,7 @@ def _isolate(tmp_path, monkeypatch):
     yield
     stt.clear_cache()
     mcconfig.clear_cache()
+    ownerstate.clear()
 
 
 def on_brew(tmp_path: Path, name: str, target: Path) -> Path:
@@ -220,3 +229,89 @@ def fake_mc(tmp_path, monkeypatch):
     mc.path.chmod(0o755)
     mc.set(json=mc_json())
     return mc
+
+
+# ------------------------------------------------------------ fake owners (adopt / uninstall / setup)
+
+FAKE_OWNER = r'''#!{python}
+"""A fake owner CLI. answers[key] = JSON document (or list: JSON Lines),
+rc[key] = exit code, old = keys that are a usage error (exit 2), guarded =
+keys that test the channel marker like meeting-capture's reader (exit 3)."""
+import json, os, sys
+here = os.path.dirname(os.path.realpath(__file__))
+name = os.path.basename(__file__)
+state = json.load(open(os.path.join(here, name + ".json")))
+args = sys.argv[1:]
+key = " ".join(a for a in args if a != "--json")
+with open(os.environ.get("FAKE_OWNER_LOG") or os.path.join(here, "calls.jsonl"), "a") as f:
+    f.write(json.dumps({"exe": os.path.abspath(__file__), "name": name, "args": args,
+                        "channel": os.environ.get("CONTORCH_CHANNEL"), "op": os.environ.get("CONTORCH_OP")}) + "\n")
+def match(table):
+    for k in sorted(table, key=len, reverse=True):
+        if key == k or key.startswith(k + " "):
+            return table[k]
+    return None
+if match({k: 1 for k in state.get("old", [])}):
+    sys.stderr.write("usage: %s: error: unrecognized arguments\n" % name); sys.exit(2)
+if match({k: 1 for k in state.get("guarded", [])}):
+    marker = os.path.join(os.environ["HOME"], ".contorch", "channel.json")
+    if os.path.exists(marker):
+        m = json.load(open(marker))
+        me = os.environ.get("CONTORCH_CHANNEL") or "dev"
+        me = me if me in ("app", "brew", "dev") else "dev"
+        op = m.get("op")
+        ok = me in (m.get("writers") or []) and (op is None or os.environ.get("CONTORCH_OP") == op.get("id"))
+        if not ok:
+            print(json.dumps({"schema": "x/1", "ok": False, "error": {"code": "channel_conflict",
+                              "message": m.get("blocked_message")}}))
+            sys.exit(3)
+ans = match(state.get("answers", {}))
+for doc in (ans if isinstance(ans, list) else [ans] if ans is not None else []):
+    print(json.dumps(doc))
+sys.exit(match(state.get("rc", {})) or 0)
+'''
+
+
+class FakeOwner:
+    """One fake executable (meeting-capture, contorch-memory, contorch …) in
+    `bindir`, configured through <name>.json; every call is logged (argv,
+    $CONTORCH_CHANNEL, $CONTORCH_OP) to bindir/calls.jsonl."""
+
+    def __init__(self, bindir: Path, name: str, **state):
+        bindir.mkdir(parents=True, exist_ok=True)
+        self.bindir, self.name = bindir, name
+        self.path = bindir / name
+        self.path.write_text(FAKE_OWNER.replace("{python}", sys.executable))
+        self.path.chmod(0o755)
+        self.state = {"answers": {}, "rc": {}, "old": [], "guarded": []}
+        self.set(**state)
+
+    def set(self, **state) -> "FakeOwner":
+        self.state.update(state)
+        (self.bindir / f"{self.name}.json").write_text(json.dumps(self.state))
+        return self
+
+    def answer(self, key: str, doc, rc: int = 0) -> "FakeOwner":
+        self.state["answers"][key] = doc
+        if rc:
+            self.state["rc"][key] = rc
+        return self.set()
+
+    def calls(self) -> list[dict]:
+        f = self.bindir / "calls.jsonl"
+        if not f.exists():
+            return []
+        return [c for c in (json.loads(l) for l in f.read_text().splitlines() if l.strip())
+                if c["name"] == self.name]
+
+
+def mc_agent(action: str, ok: bool = True, **extra) -> dict:
+    return {"schema": "meeting-capture.agent/1", "ok": ok, "action": action, "backend": "launchctl",
+            "label": "com.contorch.meeting-capture", "performed": ok, **extra}
+
+
+def cm_claude(action: str, ok: bool = True, **extra) -> dict:
+    part = {"present": action != "uninstall", "matches": action != "uninstall"}
+    return {"schema": "contorch-memory.claude/1", "ok": ok, "action": action, "channel": "app",
+            "mcp": dict(part), "hook": dict(part, legacy_copy="none"), "claude_md": dict(part),
+            "skill": dict(part), "blocked_by_managed_settings": False, "todo": [], "changed": [], **extra}

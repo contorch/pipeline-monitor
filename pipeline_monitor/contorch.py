@@ -778,8 +778,9 @@ def setup(log=print) -> bool:
 
 def _transcription() -> dict | None:
     """meeting-capture's answer (transcription.current), or None when its
-    agent isn't installed."""
-    if not stt.PLIST.exists():
+    agent isn't installed (meeting-capture's own `config --json`)."""
+    from . import mcconfig
+    if not mcconfig.installed():
         return None
     return stt.current(wait=True)
 
@@ -824,51 +825,152 @@ def _print_transcription_detail() -> int:
 
 
 def _cli_doctor(sub) -> None:
-    sub.add_parser("doctor", help="health-check every component").set_defaults(func=lambda args: doctor())
+    p = sub.add_parser("doctor", help="health-check every component")
+    p.add_argument("--json", action="store_true",
+                   help="one JSON document: versions, channel, modules and the owners' own JSON (redacted)")
+    p.add_argument("--bundle", action="store_true", help="with --json: also the last log lines (redacted)")
+    p.set_defaults(func=_cmd_doctor)
+
+
+def _cmd_doctor(args) -> int:
+    if not args.json:
+        return doctor()
+    from . import diagnostics, jsonout
+    with jsonout.reserved_stdout() as out:
+        doc = diagnostics.bundle()
+        if not args.bundle:
+            doc.pop("logs", None)
+        jsonout.emit(doc, out)
+    return 0
 
 
 def doctor() -> int:
+    """Everything `contorch status` shows, then each owner's own answers:
+    the permission rows (`meeting-capture check --json`), Claude Code's
+    integration (`contorch-memory claude status --json`, compared field by
+    field), the memory end to end (`contorch-memory selftest`) and
+    meeting-capture's own doctor."""
+    from . import channel as chan, diagnostics, ownerstate
+    from . import status as st
     rc = _print_status(transcription=False)
-    rc = _print_transcription_detail() or rc
-    for name in ("meeting-capture", "transcript-watcher"):
-        b = owners.locate(name)
-        if not b:
-            print(f"\n✗ {name} not on PATH")
+    warn = owners.channel_warning()
+    if warn:
+        print(f"\n! {warn}")
+    snap = st.collect(wait=True)
+    if snap.recorder_on():
+        rc = _print_transcription_detail() or rc
+        print("\n── permissions (meeting-capture check)")
+        perms = snap.permissions
+        if perms.get("source") == "log":
+            print("  · meeting-capture < 0.8 can't report them; `meeting-capture doctor` below checks sysaudio")
+        elif not perms.get("ok"):
+            print(f"  ✗ couldn't ask meeting-capture: {perms.get('error')}")
             rc = 1
-            continue
-        print(f"\n── {name} doctor")
-        res = subprocess.run([b, "doctor"])
+        elif not perms["problems"]:
+            print("  ✓ Screen & System Audio Recording and Microphone are allowed")
+        for p in perms.get("problems") or []:
+            print(f"  ✗ {p['title']}: {p['status']}" + (f" — {p['hint']}" if p.get("hint") else ""))
+            rc = 1
+    print("\n── memory (context-orchestrator)")
+    m = snap.memory
+    data = m.get("data") or {}
+    if m.get("ok"):
+        print(f"  ✓ index {data.get('vector_index')}: {data.get('docs')} docs, {data.get('transcripts')} transcripts, "
+              f"embeddings {data.get('embeddings')}")
+    else:
+        print(f"  ✗ {m.get('error') or 'unavailable'}")
+        rc = 1
+    claude = ownerstate.claude(wait=True)
+    if claude["status"] == "ok":
+        d = claude["data"]
+        for part, title in (("mcp", "MCP server"), ("hook", "auto-context hook"), ("claude_md", "CLAUDE.md block"),
+                            ("skill", "transcripts skill")):
+            row = d.get(part) or {}
+            mark = "✓" if row.get("matches") else ("·" if not row.get("present") else "!")
+            print(f"  {mark} {title}" + ("" if row.get("matches") else
+                                         (" — not installed" if not row.get("present") else " — points elsewhere")
+                                         + " (contorch setup fixes it)"))
+        if d.get("blocked_by_managed_settings"):
+            print("  ! Claude Code's managed settings block Contorch's hook or MCP server: "
+                  + "; ".join(d.get("managed_reasons") or []))
+        if not d.get("ok"):
+            rc = 1
+    elif claude["status"] == "old":
+        print("  · context-orchestrator < 0.5 can't report Claude Code's integration — upgrade it")
+    else:
+        print(f"  ✗ Claude Code integration: {claude.get('error')}")
+    sm = diagnostics.smoke()
+    print(f"  {'✓' if sm['ok'] else '✗'} end to end: {sm['summary']}")
+    if not sm["ok"] and (sm.get("error") or {}).get("code") not in ("offline", "proxy"):
+        rc = 1
+    for a in chan.attention():
+        print(f"  ! {a['code']}: {a.get('message') or ''}")
+    mc = owners.locate("meeting-capture")
+    if snap.recorder_on() and mc:
+        print("\n── meeting-capture doctor")
+        res = subprocess.run([mc, "doctor"])
         rc = rc or res.returncode
-    claude = shutil.which("claude")
-    if claude:
-        res = _run([claude, "mcp", "get", MCP_NAME])
-        print(f"\n── Claude Code\n  {'✓ MCP server registered' if res.returncode == 0 else '✗ MCP server not registered — run contorch setup'}")
     return rc
 
 
 # ------------------------------------------------------------------ CLI
 
 def _cli_status(sub) -> None:
-    sub.add_parser("status", help="show every contorch daemon, whether it is running, and the "
-                                  "transcription engine").set_defaults(func=lambda args: _print_status())
+    sub.add_parser("status", help="what this Mac has (modules), whether it is recording, the memory, and how "
+                                  "meetings are transcribed").set_defaults(func=lambda args: _print_status())
+
+
+HEADLINES = {"needs_setup": "Contorch isn't set up on this Mac yet — run `contorch setup`",
+             "memory_only": "Memory only — this Mac doesn't record",
+             "recording": "● Recording a meeting",
+             "recording_unknown": "? Can't tell whether a meeting is being recorded",
+             "idle": "○ Idle — ready to record"}
 
 
 def _print_status(transcription: bool = True) -> int:
-    rows = status()
-    if not rows:
-        print("No contorch daemons are installed. Run the installer first.")
-        return 1
+    """The headline, the modules, what runs, the memory and the
+    transcription engine — from the owners' answers (status.collect)."""
+    from . import status as st
+    snap = st.collect(wait=True)
+    head = snap.headline()
+    print(HEADLINES[head] + (f" ({snap.recording.get('reason')})" if head == "recording_unknown" else ""))
     if is_stopped():
-        print("contorch is STOPPED (run `contorch resume` to start it again)\n")
-    for r in rows:
-        if r["pid"]:
-            state = f"running (pid {r['pid']})"
-        elif r["disabled"]:
-            state = "stopped"
-        else:
-            state = "not running"
-        print(f"  {r['desc']:<24} {state:<22} {r['label']}")
-    t = _transcription() if transcription else None
+        print("contorch is STOPPED (run `contorch resume` to start it again)")
+    print()
+    for r in snap.modules.get("modules") or []:
+        line = f"  {r['title']:<28} {r['state']}"
+        if r.get("no_engine"):
+            line += f" — {r['no_engine']}"
+        elif r.get("add"):
+            line += f"   ({r['add']['command']})"
+        print(line)
+    print()
+    if snap.recorder_on():
+        rec = snap.recording
+        if rec.get("pid") and rec.get("reason") != "daemon_not_running":
+            print(f"  {'recorder':<24} running (pid {rec['pid']})")
+        for row in status():
+            if row["component"] == "meeting-capture" and rec.get("source") != "owner":
+                state = (f"running (pid {row['pid']})" if row["pid"] else
+                         "stopped" if row["disabled"] else "not running")
+                print(f"  {'recorder':<24} {state}")
+        for p in snap.permissions.get("problems") or []:
+            print(f"  {'':<24} ⚠ {p['title']}: {p['status']}" + (f" — {p['hint']}" if p.get("hint") else ""))
+    else:
+        print(f"  {'background':<24} nothing runs")
+    for row in status():                       # retired agents an older install left behind
+        if row["component"] != "meeting-capture":
+            state = f"running (pid {row['pid']})" if row["pid"] else "not running"
+            print(f"  {row['desc']:<24} {state}   (retired: `contorch setup` removes it)")
+    m = snap.memory
+    data = m.get("data") or {}
+    if m.get("ok"):
+        idx = "keyword search only" if data.get("vector_index") == "none" else \
+            f"{data.get('docs')} docs ({data.get('vector_index')}, embeddings {data.get('embeddings')})"
+        print(f"  {'memory':<24} {idx}; {data.get('transcripts')} transcripts")
+    else:
+        print(f"  {'memory':<24} ✗ {m.get('error') or 'unavailable'}")
+    t = _transcription() if transcription and snap.recorder_on() else None
     if t is not None:
         d = t["data"]
         print(f"\n  {'transcription':<24} {t['label']}"
@@ -877,7 +979,8 @@ def _print_status(transcription: bool = True) -> int:
             print(f"  {'':<24} audio: {t['privacy']}" + (f" ({t['privacy_fix']})" if t["privacy_fix"] else ""))
         if t["note"]:
             print(f"  {'':<24} ! {t['note']}")
-    return 0
+    nothing = head == "needs_setup" and not owners.locate("contorch-memory") and not owners.locate("meeting-capture")
+    return 1 if nothing else 0
 
 
 # Commands that live in their own modules: each defines add_cli(subparsers)

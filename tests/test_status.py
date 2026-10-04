@@ -25,7 +25,7 @@ def test_recording_detected_from_chunk_lines_in_both_log_formats(tmp_path, monke
         f"{_ts(30)} INFO chunk 9.1s [them] -> meeting-2026-09-29T10-00-00{suffix} (226 chars)\n"
     )
     monkeypatch.setattr(st, "MEETING_CAPTURE_LOG", log)
-    r = st.recording_status()
+    r = st.log_recording_status()
     assert r["recording"] is True
     assert r["current_file"] == f"meeting-2026-09-29T10-00-00{suffix}"
     assert r["last_chunk_age_s"] < 60 and r["stale"] is False
@@ -36,7 +36,7 @@ def test_session_line_names_the_meeting_before_any_chunk(tmp_path, monkeypatch):
     log.write_text(f"{_ts(5)} INFO mic active — starting recording session\n"
                    f"{_ts(4)} INFO new session: meeting-2026-09-29T10-00-00\n")
     monkeypatch.setattr(st, "MEETING_CAPTURE_LOG", log)
-    r = st.recording_status()
+    r = st.log_recording_status()
     assert r["recording"] and r["current_file"] == "meeting-2026-09-29T10-00-00"
 
 
@@ -78,42 +78,55 @@ def test_recent_sessions_without_the_table_still_work(tmp_path, monkeypatch):
     assert r["ok"] and r["sessions"] == [] and r["total_count"] == 0
 
 
-@pytest.mark.parametrize("line,env,key,mode", [
-    ("CO_EMBEDDING_MODEL=none\n", None, False, "none"),
-    ("CO_EMBEDDING_MODEL=gemini-embedding-001\n", None, True, "gemini"),
-    ("CO_EMBEDDING_MODEL=local\n", None, True, "local"),
-    ("", None, True, "gemini"),          # unset + key → auto Gemini
-    ("", None, False, "local"),          # unset, no key → local
-    ("CO_EMBEDDING_MODEL=local\n", "none", True, "none"),   # environment wins
-])
-def test_embeddings_mode_from_env_file(tmp_path, monkeypatch, line, env, key, mode):
-    f = tmp_path / "env"; f.write_text("# x\n" + line)
-    k = tmp_path / "key"
-    if key:
-        k.write_text("AIza-test")
-    monkeypatch.setattr(st, "CO_ENV_FILE", f)
-    monkeypatch.setattr(st, "GEMINI_KEY_FILE", k)
-    for v in ("GOOGLE_API_KEY", "GEMINI_API_KEY", "CO_EMBEDDING_MODEL"):
-        monkeypatch.delenv(v, raising=False)
-    if env:
-        monkeypatch.setenv("CO_EMBEDDING_MODEL", env)
-    e = st.embeddings_status()
-    assert e["mode"] == mode and e["off"] == (mode == "none")
+# ------------------------------------------------------------ the memory, from context-orchestrator
+
+def _cm(tmp_path, doc=None, rc=0, old=False):
+    from conftest import FakeOwner, on_brew
+    o = FakeOwner(tmp_path / "cm", "contorch-memory", old=["status"] if old else [])
+    if doc is not None:
+        o.answer("status", doc, rc=rc)
+    on_brew(tmp_path, "contorch-memory", o.path)
+    return o
 
 
-def test_chroma_down_is_not_an_error_when_embeddings_are_off():
-    snap = st.Snapshot(chroma={"ok": False, "error": "refused"}, embeddings={"off": True})
-    assert snap.overall() == "ok"
-    snap = st.Snapshot(chroma={"ok": False, "error": "refused"}, embeddings={"off": False, "mode": "gemini"})
-    assert snap.overall() == "err"
+def test_memory_status_is_context_orchestrators_answer(tmp_path):
+    _cm(tmp_path, {"schema": "contorch-memory.status/1", "ok": True, "embeddings": "local",
+                   "vector_index": "in_process", "docs": 42, "transcripts": 7, "index_compatible": True})
+    m = st.memory_status(wait=True)
+    assert m["ok"] and m["data"]["docs"] == 42 and m["keyword_only"] is False
+
+
+def test_memory_status_keyword_only_and_errors(tmp_path):
+    o = _cm(tmp_path, {"schema": "contorch-memory.status/1", "ok": True, "vector_index": "none"})
+    assert st.memory_status(wait=True)["keyword_only"] is True
+    st.ownerstate.clear()
+    o.answer("status", {"schema": "contorch-memory.status/1", "ok": False, "vector_index": "in_process",
+                        "error": {"code": "chroma_downgrade", "message": "index written by 1.6"}}, rc=1)
+    m = st.memory_status(wait=True)
+    assert m["ok"] is False and m["error"].startswith("chroma_downgrade")
+
+
+def test_memory_status_with_an_old_context_orchestrator(tmp_path):
+    _cm(tmp_path, old=True)
+    m = st.memory_status(wait=True)
+    assert m["ok"] is False and "< 0.5" in m["error"]
+
+
+def test_no_embedding_rules_are_mirrored_here():
+    """INV-D2 closed: pm reads `contorch-memory status --json`, it doesn't
+    re-derive the embedding choice from the env file and the key."""
+    src = (st.Path(st.__file__)).read_text()
+    assert "CO_EMBEDDING_MODEL" not in src and "embeddings_status" not in src
+    assert "import httpx" not in src and "8765" not in src
 
 
 # ------------------------------------------------------------ transcription engine
 
 def test_transcription_status_without_the_agent(fake_mc):
-    t = st.transcription_status()
-    assert t["ok"] is False and "not installed" in t["error"]
-    assert fake_mc.calls() == []                     # nothing to ask without the recorder
+    fake_mc.set(rc={"config --json": 2})              # meeting-capture 0.7: the plist says
+    t = st.transcription_status(wait=True)
+    assert t["ok"] is False and "isn't installed" in t["error"]
+    assert fake_mc.reads() == 0                      # stt isn't asked without the recorder
 
 
 def test_transcription_status_asks_meeting_capture_in_the_background(fake_mc):
@@ -135,11 +148,12 @@ def test_transcription_status_asks_meeting_capture_in_the_background(fake_mc):
 
 
 @pytest.mark.parametrize("t,overall", [
-    ({"ok": True, "status": "ok", "attention": False}, "ok"),
-    ({"ok": True, "status": "checking", "attention": False}, "ok"),
-    ({"ok": True, "status": "error", "attention": False}, "ok"),     # unknown: not flagged
+    ({"ok": True, "status": "ok", "attention": False}, "idle"),
+    ({"ok": True, "status": "checking", "attention": False}, "idle"),
+    ({"ok": True, "status": "error", "attention": False}, "idle"),   # unknown: not flagged
     ({"ok": True, "status": "ok", "attention": True}, "err"),        # nothing can transcribe
-    ({"ok": False, "attention": True}, "ok"),
+    ({"ok": False, "attention": True}, "idle"),
 ])
 def test_overall_flags_when_nothing_can_transcribe(t, overall):
-    assert st.Snapshot(chroma={"ok": True}, transcription=t).overall() == overall
+    recorder = {"installed": True, "ok": True, "mode": "batch"}
+    assert st.Snapshot(memory={"ok": True}, capture_mode=recorder, transcription=t).overall() == overall

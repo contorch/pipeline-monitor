@@ -59,3 +59,43 @@ def test_reopen_handler_is_added_to_rumps_delegate():
     app.install_reopen(FakeApp())                                  # idempotent
     m = app.rumps.rumps.NSApp.instanceMethodSignatureForSelector_(sel)
     assert m.methodReturnType() in (b"Z", b"B") and m.numberOfArguments() == 4
+
+
+# ------------------------------------------------------------ the whole menu, built for real
+
+def _titles(menu):
+    out = []
+    for item in menu.values():
+        if hasattr(item, "title"):
+            out.append(item.title)
+            out += [f"  {t}" for t in _titles(item)] if len(item) else []
+    return out
+
+
+@pytest.mark.parametrize("channel,loc", [("brew", None), ("app", "ok"), ("app", "translocated")])
+def test_menu_builds_in_every_channel(monkeypatch, tmp_path, channel, loc):
+    """PipelineMonitor() paints its menu at construction (no run loop): the
+    Contorch.app rows must work before anything else has run."""
+    from pipeline_monitor import lifecycle, loginitem
+    from pipeline_monitor import status as st
+    monkeypatch.setenv("CONTORCH_CHANNEL", channel)
+    if channel == "app":
+        root = tmp_path / "Applications" / "Contorch.app"
+        (root / "Contents" / "Resources" / "bin").mkdir(parents=True)
+        monkeypatch.setattr(owners, "bundle_root", lambda executable=None: root)
+        monkeypatch.setattr(lifecycle, "location", lambda: loc)
+        monkeypatch.setattr(loginitem, "status", lambda force=False: "not_registered")
+    monkeypatch.setattr(st, "collect", lambda wait=False: st.Snapshot(modules={"set_up": True, "modules": []}))
+    monkeypatch.setattr(app.threading, "Thread", lambda *a, **k: type("T", (), {"start": lambda self: None})())
+    monkeypatch.setattr(app.AppHelper, "callAfter", lambda *a, **k: None)
+    pm = app.PipelineMonitor()
+    titles = _titles(pm.menu)
+    assert "Quit" in titles and "Diagnostics" in titles and "  Report a problem…" in titles
+    if channel == "app":
+        assert "Open at Login" in titles
+        assert ("Move Contorch to Applications…" in titles) == (loc != "ok")
+        if loc == "ok":
+            from pipeline_monitor import setup_launcher
+            assert setup_launcher.command_path().is_file()       # written at launch
+    else:
+        assert "Open at Login" not in titles and "Move Contorch to Applications…" not in titles

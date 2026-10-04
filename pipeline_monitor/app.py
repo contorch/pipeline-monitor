@@ -640,6 +640,8 @@ class _MenuOpenDelegate(NSObject):
 
 class PipelineMonitor(rumps.App):
     def __init__(self):
+        self._updates = None                      # Contorch.app: pipeline_monitor.updates.Updates
+        self._busy: str | None = None             # "Uninstalling…" etc. while a verb runs
         self._mode_switching: str | None = None  # target mode while a switch is in flight
         self._stack_busy: str | None = None      # 'Stopping'/'Resuming' while a stop/resume runs
         # Use the template glyph if available; otherwise fall back to text.
@@ -684,8 +686,6 @@ class PipelineMonitor(rumps.App):
 
         # Contorch.app: Sparkle (only from /Applications), the setup
         # launcher's .command (rewritten so it points at this copy).
-        self._updates = None
-        self._busy: str | None = None             # "Uninstalling…" etc. while a verb runs
         if in_app():
             AppHelper.callAfter(self._start_updates)
             try:

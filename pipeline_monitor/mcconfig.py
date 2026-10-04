@@ -46,15 +46,35 @@ def clear_cache() -> None:
         _cache.update(key=None, doc=None, none_until=0.0)
 
 
-def doc(force: bool = False) -> dict | None:
+def doc(force: bool = False, wait: bool = True) -> dict | None:
     """`meeting-capture config --json`, or None when meeting-capture is
-    missing or too old to have it (then use the legacy fallbacks)."""
+    missing or too old to have it (then use the legacy fallbacks).
+    wait=False (the menu bar's timer) never runs it in the foreground: a
+    stale answer is refreshed on a background thread and the last one (or
+    None) is returned meanwhile."""
     with _lock:
         cached = _cache["doc"]
         if cached and not force and _cache["key"] == _stamp(cached.get("watch_paths") or []):
             return cached
         if not cached and not force and time.monotonic() < _cache["none_until"]:
             return None
+        if not wait:
+            start = not _cache.get("inflight")
+            _cache["inflight"] = True
+    if not wait:
+        if start:
+            def _bg() -> None:
+                try:
+                    _refresh()
+                finally:
+                    with _lock:
+                        _cache["inflight"] = False
+            threading.Thread(target=_bg, name="mc-config", daemon=True).start()
+        return cached
+    return _refresh()
+
+
+def _refresh() -> dict | None:
     res = owners.call("meeting-capture", "config", "--json", schema=SCHEMA, timeout=TIMEOUT_S,
                       foreground=False)
     fresh = res["data"] if res["status"] == "ok" else None
@@ -66,6 +86,13 @@ def doc(force: bool = False) -> dict | None:
     return fresh
 
 
+def known() -> bool:
+    """Has meeting-capture answered yet (a document, or "too old")? Until
+    then a non-waiting caller should say "checking", not "not installed"."""
+    with _lock:
+        return _cache["doc"] is not None or time.monotonic() < _cache["none_until"]
+
+
 def legacy_plist_env(plist: Path | None = None) -> dict:
     try:
         env = plistlib.loads(Path(plist or LEGACY_PLIST).read_bytes()).get("EnvironmentVariables") or {}
@@ -74,9 +101,9 @@ def legacy_plist_env(plist: Path | None = None) -> dict:
         return {}
 
 
-def setting(name: str, default: str | None = None) -> str | None:
+def setting(name: str, default: str | None = None, wait: bool = True) -> str | None:
     """One setting by its short name (`mode`, `source`, `stt`, …)."""
-    d = doc()
+    d = doc(wait=wait)
     if d is None:
         return legacy_plist_env().get(f"MEETING_CAPTURE_{name.upper()}", default)
     row = (d.get("settings") or {}).get(name.lower()) or {}
@@ -84,9 +111,9 @@ def setting(name: str, default: str | None = None) -> str | None:
     return default if v is None else str(v)
 
 
-def installed() -> bool:
+def installed(wait: bool = True) -> bool:
     """Is the recorder agent installed (either backend)?"""
-    d = doc()
+    d = doc(wait=wait)
     if d is None:
         return LEGACY_PLIST.is_file()
     return bool((d.get("agent") or {}).get("installed"))

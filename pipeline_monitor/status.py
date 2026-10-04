@@ -6,6 +6,14 @@ unreachable. A half-installed pipeline must still produce a useful
 dashboard, not a wall of red.
 
 Each collector is independent. The app composes them.
+
+Decisions come from the owners' JSON (pipeline_monitor.ownerstate):
+"recording?" from `meeting-capture status --json`, the permission rows from
+`meeting-capture check --json`, the index from `contorch-memory status
+--json`, meeting-capture's settings from `config --json` (mcconfig), the
+modules from pipeline_monitor.modules. The daemon-log parser below only
+DISPLAYS recent activity (the meeting, a silent chunk) and stands in for
+meeting-capture 0.7, which has no status/check --json.
 """
 from __future__ import annotations
 
@@ -20,60 +28,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import httpx
-
+from . import mcconfig, modules, owners, ownerstate
 from . import transcription as stt
 
 HOME = Path.home()
 CO_DIR = HOME / ".context-orchestrator"
 CO_DB = CO_DIR / "context.db"
-CO_CHROMA_DIR = CO_DIR / "chroma"
 HOOK_HEARTBEAT = CO_DIR / "auto-context-heartbeat.json"
 TRANSCRIPTS_DIR = HOME / "transcripts"
 MEETING_CAPTURE_DIR = HOME / ".meeting-capture"
 MEETING_CAPTURE_LOG = MEETING_CAPTURE_DIR / "daemon.log"
-
-CHROMA_HOST = "127.0.0.1"
-CHROMA_PORT = 8765
-CHROMA_TIMEOUT = 1.0  # seconds
-
-
-# ----------------------------------------------------------- chroma
-
-def chroma_status() -> dict[str, Any]:
-    """Heartbeat + collection stats from the chroma daemon."""
-    base = f"http://{CHROMA_HOST}:{CHROMA_PORT}"
-    out: dict[str, Any] = {"ok": False, "host": f"{CHROMA_HOST}:{CHROMA_PORT}"}
-    try:
-        with httpx.Client(timeout=CHROMA_TIMEOUT) as cx:
-            hb = cx.get(f"{base}/api/v2/heartbeat")
-            hb.raise_for_status()
-            out["heartbeat_ns"] = hb.json().get("nanosecond heartbeat")
-
-            # Get default collection
-            tdb = "/api/v2/tenants/default_tenant/databases/default_database"
-            colls = cx.get(f"{base}{tdb}/collections")
-            colls.raise_for_status()
-            ctx = next((c for c in colls.json() if c["name"] == "context"), None)
-            if ctx:
-                out["collection_id"] = ctx["id"]
-                cnt = cx.get(f"{base}{tdb}/collections/{ctx['id']}/count")
-                cnt.raise_for_status()
-                out["doc_count"] = int(cnt.text)
-
-                # Sample one embedding to expose dim
-                sample = cx.post(
-                    f"{base}{tdb}/collections/{ctx['id']}/get",
-                    json={"limit": 1, "include": ["embeddings"]},
-                )
-                if sample.status_code == 200:
-                    embs = sample.json().get("embeddings") or []
-                    if embs and embs[0]:
-                        out["dim"] = len(embs[0])
-        out["ok"] = True
-    except Exception as e:
-        out["error"] = f"{type(e).__name__}: {e}"
-    return out
 
 
 # ----------------------------------------------------------- context-orch SQLite
@@ -107,41 +71,28 @@ def db_status() -> dict[str, Any]:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
-# ----------------------------------------------------------- embeddings
+# ----------------------------------------------------------- memory (context-orchestrator)
 
-CO_ENV_FILE = CO_DIR / "env"
-GEMINI_KEY_FILE = HOME / ".config" / "google" / "key"
-
-
-def embeddings_status() -> dict[str, Any]:
-    """Which embedding model context-orchestrator uses (`contorch-memory
-    embeddings gemini|local|none`, stored as CO_EMBEDDING_MODEL in
-    ~/.context-orchestrator/env). "none" = keyword (full-text) search only.
-    Mirrors context_orchestrator.search.embedding_choice()."""
-    raw = os.environ.get("CO_EMBEDDING_MODEL", "")
-    if not raw:
-        try:
-            for line in CO_ENV_FILE.read_text(encoding="utf-8").splitlines():
-                k, _, v = line.strip().partition("=")
-                if k.strip().removeprefix("export ").strip() == "CO_EMBEDDING_MODEL":
-                    raw = v.strip().strip('"').strip("'")
-        except OSError:
-            pass
-    low = raw.strip().lower()
-    has_key = bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-                   or (GEMINI_KEY_FILE.exists() and GEMINI_KEY_FILE.stat().st_size > 0))
-    if low in ("none", "fts", "keyword"):
-        mode = "none"
-    elif low in ("off", "default", "local"):
-        mode = "local"
-    elif low in ("gemini",) or low.startswith("gemini-") or (not low and has_key):
-        mode = "gemini"
-    elif not low:
-        mode = "local"
+def memory_status(wait: bool = False) -> dict[str, Any]:
+    """The index as context-orchestrator reports it (`contorch-memory status
+    --json`: embeddings, vector_index in_process|server|none, docs,
+    transcripts, index_compatible). pm no longer mirrors the embedding rules
+    (INV-D2). {"ok", "status", "data", "error", "label"}."""
+    r = ownerstate.memory(wait)
+    d = r.get("data") or {}
+    out: dict[str, Any] = {"status": r["status"], "data": d or None, "error": r.get("error")}
+    if r["status"] == "ok":
+        out["ok"] = bool(d.get("ok"))
+        if not d.get("ok") and d.get("error"):
+            out["error"] = f"{d['error'].get('code')}: {d['error'].get('message')}"
+        out["keyword_only"] = d.get("vector_index") == "none"
+    elif r["status"] == "old":
+        out.update(ok=False, error="context-orchestrator < 0.5 — upgrade it (brew upgrade context-orchestrator)")
+    elif r["status"] == "checking":
+        out["ok"] = True
     else:
-        mode = raw
-    return {"ok": True, "mode": mode, "configured": raw or "auto",
-            "has_key": has_key, "off": mode == "none"}
+        out["ok"] = False
+    return out
 
 
 # ----------------------------------------------------------- MCP server log
@@ -235,30 +186,21 @@ LAUNCHD_TARGETS = [
     for org in ("contorch", "stirredo")
 ]
 
-MEETING_CAPTURE_PLIST = HOME / "Library" / "LaunchAgents" / "com.contorch.meeting-capture.plist"
 CAPTURE_MODES = ("batch", "live")
 
 
-def capture_mode_status() -> dict[str, Any]:
-    """Which capture mode the meeting-capture launchd agent is configured for.
-
-    Read straight from the agent's plist rather than shelling out to
-    `meeting-capture mode`: it is the same key the CLI edits
-    (MEETING_CAPTURE_MODE), costs a file read, and stays correct even when
-    the daemon is between relaunches. "batch" when the key is absent.
-    """
-    out: dict[str, Any] = {"ok": False, "mode": "batch", "installed": MEETING_CAPTURE_PLIST.exists()}
+def capture_mode_status(wait: bool = True) -> dict[str, Any]:
+    """Which capture mode the recorder is configured for, as meeting-capture
+    reports it (`meeting-capture config --json`; meeting-capture 0.7: its
+    plist). "batch" when unset. wait=False (the menu timer): the cached
+    answer, refreshed in the background."""
+    out: dict[str, Any] = {"ok": False, "mode": "batch", "installed": mcconfig.installed(wait=wait)}
     if not out["installed"]:
-        out["error"] = "meeting-capture launchd agent not installed"
+        out["error"] = "meeting-capture's recorder agent isn't installed"
         return out
-    try:
-        import plistlib
-        env = plistlib.loads(MEETING_CAPTURE_PLIST.read_bytes()).get("EnvironmentVariables") or {}
-        mode = str(env.get("MEETING_CAPTURE_MODE", "batch")).strip().lower()
-        out["mode"] = mode if mode in CAPTURE_MODES else "batch"
-        out["ok"] = True
-    except Exception as e:
-        out["error"] = str(e)
+    mode = str(mcconfig.setting("mode", "batch", wait=wait) or "batch").strip().lower()
+    out["mode"] = mode if mode in CAPTURE_MODES else "batch"
+    out["ok"] = True
     return out
 
 
@@ -273,9 +215,9 @@ def transcription_status(wait: bool = False) -> dict[str, Any]:
     so the 5-second timer never waits on it. {"ok": False} without the
     recorder's launchd agent (the menu leaves the line out)."""
     try:
-        if not stt.PLIST.exists():
+        if not mcconfig.installed(wait=wait):
             return {"ok": False, "installed": False,
-                    "error": "meeting-capture launchd agent not installed"}
+                    "error": "meeting-capture's recorder agent isn't installed"}
         return stt.current(wait=wait)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -397,8 +339,10 @@ def transcript_text(meeting_id: str) -> str | None:
 _CHUNK_RE = re.compile(r"\bINFO chunk \d+(?:\.\d+)?s (?:\[\w+\] )?-> (\S+?) \(\d+ chars\)")
 _SESSION_RE = re.compile(r"new session:\s*(meeting-\S+)", re.IGNORECASE)
 
-def recording_status() -> dict[str, Any]:
-    """Is meeting-capture currently recording? Heuristic: read its log tail.
+def log_recording_status() -> dict[str, Any]:
+    """What the daemon log's tail shows: DISPLAY only (the current meeting,
+    a recording that has gone silent), and the stand-in for meeting-capture
+    0.7, which has no `status --json`. Decisions use recording_status().
 
     meeting-capture daemon's actual log vocabulary (verified May 2026):
       • `mic active — starting recording session`           → start
@@ -564,6 +508,91 @@ def recording_status() -> dict[str, Any]:
     return out
 
 
+def recording_status(wait: bool = False) -> dict[str, Any]:
+    """Is a meeting being recorded right now? meeting-capture's answer
+    (`meeting-capture status --json`): recording true | false | None (can't
+    tell — never shown as ● REC). The log only adds display detail (the
+    meeting's name, a recording gone silent). meeting-capture 0.7 has no
+    status --json: the log parser decides, as before (source "log")."""
+    log = log_recording_status()
+    r = ownerstate.recorder(wait)
+    if r["status"] in ("old", "missing", "not_built"):
+        return {**log, "source": "log"}
+    out: dict[str, Any] = {"ok": True, "source": "owner", "recording": None}
+    if r["status"] == "ok":
+        d = r["data"]
+        out.update(recording=d.get("recording"), state=d.get("state"), since=d.get("since"),
+                   pid=d.get("pid"), reason=d.get("reason"), meeting_id=d.get("meeting_id"))
+    elif r["status"] == "checking":
+        out["reason"] = "checking"
+    else:
+        out["reason"] = "error"
+        out["error"] = r.get("error")
+    if out["recording"]:
+        out["current_file"] = out.get("meeting_id") or log.get("current_file")
+        if log.get("recording") and log.get("stale"):
+            out["stale"] = True
+            out["last_chunk_age_s"] = log.get("last_chunk_age_s")
+    return out
+
+
+def permissions_status(wait: bool = False) -> dict[str, Any]:
+    """The recorder's permissions as meeting-capture reports them
+    (`meeting-capture check --json`): rows not granted, each with
+    meeting-capture's own hint and Privacy pane URL. meeting-capture 0.7 has
+    no check --json: a recent "declined TCCs" in its log is all there is."""
+    r = ownerstate.permissions(wait)
+    if r["status"] == "ok":
+        probs = ownerstate.permission_problems(r["data"])
+        return {"ok": True, "source": "owner", "problems": probs,
+                "denied": [p for p in probs if p["status"] in ("denied", "not_granted")],
+                "identity": (r["data"] or {}).get("identity")}
+    if r["status"] == "old":
+        log = log_recording_status()
+        if log.get("permission_denied"):
+            prob = {"id": "screen_audio", "title": "Screen & System Audio Recording", "status": "denied",
+                    "hint": LEGACY_PERMISSION_HINT, "settings_url": SCREEN_PANE}
+            return {"ok": True, "source": "log", "problems": [prob], "denied": [prob]}
+        return {"ok": True, "source": "log", "problems": [], "denied": []}
+    return {"ok": False, "source": "owner", "problems": [], "denied": [], "status": r["status"],
+            "error": r.get("error")}
+
+
+# meeting-capture 0.7 only (its check has no --json and no per-channel hint).
+LEGACY_PERMISSION_HINT = ("sysaudio was refused Screen & System Audio Recording — `meeting-capture doctor` "
+                          "shows which sysaudio to allow")
+SCREEN_PANE = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+
+
+def modules_status(wait: bool = False) -> dict[str, Any]:
+    """The module rows (modules.status) from the owners' answers: memory =
+    this install's MCP entry exists (Claude Code status), recorder / line-in
+    from meeting-capture's settings. wait=False (the menu): cached answers
+    only, never a subprocess in the foreground."""
+    try:
+        ch = owners.channel()
+        claude = ownerstate.claude(wait)
+        mem = None
+        if claude["status"] == "ok":
+            mem = bool(((claude["data"] or {}).get("mcp") or {}).get("present"))
+        elif claude["status"] in ("missing",):
+            mem = False
+        if owners.locate("meeting-capture"):
+            rec = mcconfig.installed(wait=wait)
+            lin = bool(rec) and mcconfig.setting("source", "sck", wait=wait) == "linein"
+            if not mcconfig.known():          # still asking: unknown, never "not set up"
+                rec = lin = None
+        else:
+            rec = lin = False
+        actual = {"memory": mem, "recorder": rec, "linein": lin,
+                  "cli": True if ch != "app" else bool(modules.cli_links()["linked"])}
+        doc = modules.status(ch, actual=actual)
+        doc["claude"] = claude.get("data")
+        return doc
+    except Exception as e:  # noqa: BLE001 — the menu must render
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "modules": [], "set_up": False}
+
+
 # ----------------------------------------------------------- auto-context hook heartbeat
 
 def hook_status() -> dict[str, Any]:
@@ -591,7 +620,6 @@ def disk_status() -> dict[str, Any]:
     try:
         for label, path in [
             ("context-orchestrator", CO_DIR),
-            ("chroma", CO_CHROMA_DIR),
             ("meeting-capture", MEETING_CAPTURE_DIR),
         ]:
             if path.is_dir():
@@ -613,83 +641,101 @@ def disk_status() -> dict[str, Any]:
 class Snapshot:
     """All collectors' output bundled into one frame."""
     ts: float = field(default_factory=time.time)
-    chroma: dict[str, Any] = field(default_factory=dict)
+    memory: dict[str, Any] = field(default_factory=dict)
     db: dict[str, Any] = field(default_factory=dict)
     mcp: dict[str, Any] = field(default_factory=dict)
     launchd: dict[str, Any] = field(default_factory=dict)
     recordings: dict[str, Any] = field(default_factory=dict)
     recording: dict[str, Any] = field(default_factory=dict)
+    permissions: dict[str, Any] = field(default_factory=dict)
     capture_mode: dict[str, Any] = field(default_factory=dict)
     hook: dict[str, Any] = field(default_factory=dict)
     disk: dict[str, Any] = field(default_factory=dict)
-    embeddings: dict[str, Any] = field(default_factory=dict)
     transcription: dict[str, Any] = field(default_factory=dict)
+    modules: dict[str, Any] = field(default_factory=dict)
+
+    def recorder_on(self) -> bool:
+        """Does this Mac record (the recorder module is on, or — before any
+        choice — its agent is installed)?"""
+        rows = {r["id"]: r for r in self.modules.get("modules") or []}
+        rec = rows.get("recorder")
+        if rec is None:
+            return bool(self.capture_mode.get("installed"))
+        return rec["state"] in ("on", "attention")
+
+    def memory_only(self) -> bool:
+        return bool(self.modules.get("set_up")) and not self.recorder_on()
+
+    def headline(self) -> str:
+        """recording | recording_unknown | memory_only | idle | needs_setup."""
+        if not self.modules.get("set_up", True):
+            return "needs_setup"
+        if self.memory_only():
+            return "memory_only"
+        rec = self.recording.get("recording")
+        if rec:
+            return "recording"
+        if rec is None and self.recording.get("source") == "owner" \
+                and self.recording.get("reason") not in ("checking", "daemon_not_running"):
+            return "recording_unknown"
+        return "idle"
 
     def overall(self) -> str:
-        """State for the menu bar icon: rec / rec_stale / perm / err / ok.
+        """State for the menu bar icon: rec / rec_stale / perm / err / idle.
 
-        Only flag 'err' for things that actually mean something is broken:
-          - chroma daemon unreachable
-          - any installed launchd daemon stopped
-          - MCP server has a recent tool-call failure (not just idle)
-          - nothing can transcribe (meeting-capture's `stt --json` says not
-            ready): meetings are recorded but stay untranscribed
-        We deliberately do NOT flag MCP as 'err' just because it hasn't
-        seen a tool call recently — Claude Code might just not be open.
+        ● REC only when meeting-capture says recording: true (the log only
+        for meeting-capture 0.7). 'err' only for things that are broken:
+          - the memory (context-orchestrator's status says not ok)
+          - the recorder's agent isn't running while it should
+          - nothing can transcribe (meeting-capture's `stt --json`)
+          - MCP's most recent tool call failed in the last hour
+        A memory-only Mac has no recorder to complain about.
         """
-        if self.recording.get("recording"):
-            # Distinguish a healthy live recording from one where the daemon
-            # claims REC but no chunks are landing — the latter is a loud
-            # ⚠ in the menu bar so the user notices mid-meeting.
-            if self.recording.get("stale"):
-                return "rec_stale"
-            return "rec"
-        if self.recording.get("permission_denied"):
-            # sysaudio is being refused Screen Recording — every session dies
-            # at spawn, so the meeting is NOT being captured. Loudest state
-            # short of a live recording.
+        recorder = self.recorder_on()
+        if recorder and self.recording.get("recording"):
+            return "rec_stale" if self.recording.get("stale") else "rec"
+        if recorder and self.permissions.get("denied"):
             return "perm"
         problems = []
-        # With embeddings off there is no vector index to reach — keyword
-        # search runs on SQLite, so an absent chroma is not a problem.
-        if not self.chroma.get("ok") and not self.embeddings.get("off"):
-            problems.append("chroma")
-        for label, info in self.launchd.get("daemons", {}).items():
-            if info.get("installed") and not info.get("running"):
-                problems.append(label.split(".")[-1])
-        if self.transcription.get("ok") and self.transcription.get("attention"):
-            problems.append("transcription")
-        # Only flag MCP if its MOST RECENT call failed (active problem),
-        # not if it's been idle.
+        if self.memory and not self.memory.get("ok", True):
+            problems.append("memory")
+        if recorder:
+            for label, info in self.launchd.get("daemons", {}).items():
+                if label.endswith("meeting-capture") and info.get("installed") and not info.get("running"):
+                    problems.append("recorder")
+            if self.transcription.get("ok") and self.transcription.get("attention"):
+                problems.append("transcription")
         last_call = self.mcp.get("last_call")
         if last_call and last_call.get("result") == "fail":
-            # And only if that failure was within the last hour
             try:
-                from datetime import datetime
                 ts_str = str(last_call.get("ts", "")).replace("Z", "+00:00")
-                age_s = time.time() - datetime.fromisoformat(ts_str).timestamp()
-                if age_s < 3600:
+                if time.time() - datetime.fromisoformat(ts_str).timestamp() < 3600:
                     problems.append("mcp")
             except Exception:
                 pass
-        return "err" if problems else "ok"
+        return "err" if problems else "idle"
 
 
 def collect(wait: bool = False) -> Snapshot:
-    """Run every collector and return a snapshot. Each call is sub-second
-    (meeting-capture is asked in the background unless wait=True)."""
+    """Run every collector and return a snapshot. Sub-second: the owners are
+    asked on background threads (wait=True asks them now: `contorch status`)."""
+    mods = modules_status(wait=wait)
+    recorder_present = owners.locate("meeting-capture") is not None
     return Snapshot(
-        chroma=chroma_status(),
+        memory=memory_status(wait=wait),
         db=db_status(),
         mcp=mcp_status(),
         launchd=launchd_status(),
         recordings=recordings_status(),
-        recording=recording_status(),
-        capture_mode=capture_mode_status(),
+        recording=recording_status(wait=wait) if recorder_present else {"ok": False, "recording": False,
+                                                                        "error": "no recorder on this Mac"},
+        permissions=permissions_status(wait=wait) if recorder_present else {"ok": True, "problems": [],
+                                                                            "denied": []},
+        capture_mode=capture_mode_status(wait=wait),
         hook=hook_status(),
         disk=disk_status(),
-        embeddings=embeddings_status(),
         transcription=transcription_status(wait=wait),
+        modules=mods,
     )
 
 
@@ -698,7 +744,8 @@ if __name__ == "__main__":
     snap = collect(wait=True)
     print(_j.dumps({
         "overall": snap.overall(),
-        "chroma": snap.chroma,
+        "headline": snap.headline(),
+        "memory": snap.memory,
         "db": snap.db,
         "mcp": {k: v for k, v in snap.mcp.items() if k != "recent_calls"},
         "mcp_recent_calls": snap.mcp.get("recent_calls", [])[-5:],

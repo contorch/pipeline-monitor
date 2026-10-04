@@ -14,14 +14,14 @@ Glanceable state in the menu bar — `○` idle / `● REC` recording / `⚠` so
 
 | Section | Data |
 |---|---|
-| **NOW** | Recording state + current meeting (from the meeting-capture daemon log) · **Transcription:** `on this Mac (en-US)` / `Gemini` / `⚠ unavailable — <reason>`, as meeting-capture reports it (details: setting, locale, on-device state, key, where audio goes) |
+| **NOW** | The headline: ● Recording / ○ Idle / "? Can't tell" from `meeting-capture status --json` (only `recording: true` is ● REC; meeting-capture 0.7: the daemon log), or **Memory only — this Mac doesn't record** · the recorder's permission rows from `meeting-capture check --json` (both Screen & System Audio Recording and Microphone, with meeting-capture's own per-channel hint; a click opens the Privacy pane) · greyed rows for modules that aren't on, each with the way to add it · **Transcription:** `on this Mac (en-US)` / `Gemini` / `⚠ unavailable — <reason>`, as meeting-capture reports it (details: setting, locale, on-device state, key, where audio goes) |
 | **RECENT SESSIONS** | Last 10 transcripts (from the context-orchestrator database; legacy `~/transcripts/*.md` too). Each has **Copy transcript** (whole text to the clipboard) and **Open in TextEdit**. |
-| **INDEX HEALTH** | Chroma doc count + embedding dim · SQLite tasks/sources/insights · last insight age |
+| **INDEX HEALTH** | From `contorch-memory status --json`: documents, embeddings, in-process / keyword-only, transcripts (pm no longer mirrors the embedding rules) · SQLite insights |
 | **MCP / CONNECTIONS** | MCP server activity · last tool call (tool, result, latency, ago) · auto-context hook last fire (ago + latency + chars injected) · expandable timeline of last 20 calls |
-| **SYSTEM HEALTH** | launchd daemon status with PIDs · disk usage per data dir |
-| **Actions** | Refresh now · Run end-to-end smoke test · **Start new meeting** (`meeting-capture new` — next speech opens a new transcript) · **Recording settings…** (`meeting-capture ui`: source, USB-interface inputs, live levels) · Open latest transcript/CO dir/MCP log · Restart chroma daemon · capture mode · Stop/Resume everything · Quit |
+| **SYSTEM HEALTH** | "Background: recorder running (pid …)" or, on a memory-only Mac, "Background: nothing runs" (the index is in-process: no chroma daemon) · disk usage per data dir |
+| **Actions** | Refresh now · Run smoke test · **Start new meeting** (`meeting-capture new` — next speech opens a new transcript) · **Recording settings…** (`meeting-capture ui`: source, USB-interface inputs, live levels) · capture mode — these three only when this Mac records · **Import transcripts…** (memory-only Macs: `contorch-transcripts import --json`) · Open latest transcript/CO dir/MCP log · Stop/Resume everything · Quit |
 
-End-to-end smoke test: inserts a marker doc → searches for it → deletes it. One-click "is the whole stack actually working right now?" check. Reports rank + latency in a notification.
+Smoke test = context-orchestrator's own end-to-end check (`contorch-memory selftest --json`: write a marker, search for it, delete it), also `contorch smoke [--json]`. `contorch doctor --json [--bundle]` prints one document for bug reports: versions, channel, modules and the owners' own JSON, plus (with `--bundle`) the last log lines — redacted: no keys, no e-mail addresses, no transcript text.
 
 ### Transcription engine
 
@@ -68,29 +68,19 @@ That's it — look for `○` in the menu bar.
 
 ## Where it expects things to live
 
-It auto-locates context-orchestrator via `$CO_REPO` env or these well-known paths (in order):
+The other packages are found with `owners.locate()` (the app's bundle; Homebrew's `opt/` paths; PATH; a per-user venv) and asked through their `--json` verbs. Read directly (read-only, display only):
 
-- `~/tasks/vector_databases_experiments`
-- `~/tasks/context-orchestrator`
-- `~/src/context-orchestrator`
-- `~/code/context-orchestrator`
-
-If yours lives elsewhere, set `CO_REPO=/path/to/repo` in your shell rc.
-
-Other paths (hard-coded, all standard for the pipeline):
-
-- `~/.context-orchestrator/` — chroma data, SQLite, daemon logs, hook heartbeat
-- `~/.context-orchestrator/context.db` — transcripts (table `transcripts`, meeting-capture ≥ 0.5); `~/transcripts/` only on older installs
-- `~/.meeting-capture/daemon.log` — recording state source-of-truth
+- `~/.context-orchestrator/context.db` — Recent sessions (table `transcripts`, meeting-capture ≥ 0.5); `~/transcripts/` only on older installs
+- `~/.meeting-capture/daemon.log` — the recent-activity display (and recording state for meeting-capture 0.7, which has no `status --json`)
 - `~/Library/Caches/claude-cli-nodejs/.../mcp-logs-context-orchestrator/` — MCP tool-call timeline source
 
 Each collector fails silently if its data source is missing — a half-installed pipeline still produces a useful dashboard, not a wall of red.
 
 ## Architecture
 
-Python 3.10+, pure stdlib + [`rumps`](https://github.com/jaredks/rumps) (NSStatusItem wrapper) + [`httpx`](https://www.python-httpx.org/) for the chroma daemon heartbeat.
+Python 3.10+, pure stdlib + [`rumps`](https://github.com/jaredks/rumps) (NSStatusItem wrapper).
 
-Read-only. Polls every 5s (meeting-capture is asked how it transcribes at most every 10 min, off the main thread). Each subsystem has its own collector function in `pipeline_monitor/status.py` — independent, fail-silent. The smoke test spawns through context-orchestrator's venv to avoid duplicating chromadb/google-genai deps.
+Read-only. Polls every 5s; the owners are asked on background threads and cached (`pipeline_monitor/ownerstate.py`: `meeting-capture status --json` every 20 s or when its state file changes, `check --json` every 10 min or when the log shows a refusal, `contorch-memory status --json` every minute; `stt --json` every 10 min). Each subsystem has its own collector function in `pipeline_monitor/status.py` — independent, fail-silent.
 
 ## Why it exists
 

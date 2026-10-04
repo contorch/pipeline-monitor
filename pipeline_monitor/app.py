@@ -25,11 +25,11 @@ import rumps
 from AppKit import NSObject
 from PyObjCTools import AppHelper  # noqa: F401  (ensures AppKit init order)
 
+from . import channel as chan
 from . import contorch as ct
-from . import owners
+from . import mcconfig, modules, owners
 from . import status as st
 from . import transcription as stt
-from .smoketest import run_smoke_test
 
 REFRESH_INTERVAL_S = 5
 PULSE_INTERVAL_S = 0.5
@@ -88,11 +88,6 @@ ICON_FALLBACK_OK = "○"
 ICON_FALLBACK_ERR = "⚠"
 ICON_FALLBACK_PERM = "⚠ PERM"
 
-PERM_HINT = (
-    "sysaudio denied Screen Recording — re-add bin/sysaudio in "
-    "System Settings → Privacy & Security → Screen & System Audio Recording"
-)
-
 
 def _ago(iso_or_seconds) -> str:
     """Human-friendly 'X ago' for an ISO timestamp or age in seconds.
@@ -139,12 +134,11 @@ def _truncate(s: str, n: int = 60) -> str:
 #   - Status glyphs only when something's wrong (●/✓/✗/⚠), not as bullets
 #   - All previous functionality still reachable, just one click deeper
 
-def _open_screen_recording_settings(_=None):
-    """Jump straight to the Screen & System Audio Recording privacy pane."""
-    subprocess.Popen([
-        "open",
-        "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
-    ])
+def _open_url_callback(url: str | None):
+    """Open a Privacy & Security pane (meeting-capture's settings_url)."""
+    def _cb(_=None):
+        subprocess.Popen(["open", url or st.SCREEN_PANE])
+    return _cb
 
 
 def _mode_suffix(snap: st.Snapshot) -> str:
@@ -153,21 +147,35 @@ def _mode_suffix(snap: st.Snapshot) -> str:
     return f" · {cm['mode']}" if cm.get("ok") else ""
 
 
+UNKNOWN_REASONS = {"no_state": "the recorder hasn't reported yet", "stale_heartbeat": "the recorder stopped reporting",
+                   "unknown_state": "the recorder's state is unreadable", "error": "meeting-capture didn't answer"}
+
+
 def _build_status_line(snap: st.Snapshot) -> rumps.MenuItem:
-    """Top of menu — recording state and capture mode. Visible at a glance."""
+    """Top of menu — the headline. ● Recording only when meeting-capture says
+    so (`meeting-capture status --json`); "can't tell" is said as such."""
     if ct.is_stopped():
         return rumps.MenuItem("⏸ contorch is stopped — nothing is recording")
+    head = snap.headline()
+    if head == "needs_setup":
+        return rumps.MenuItem("Contorch isn't set up on this Mac yet")
+    if head == "memory_only":
+        return rumps.MenuItem("Memory only — this Mac doesn't record")
     rec = snap.recording
     mode = _mode_suffix(snap)
     if not rec.get("ok"):
         return rumps.MenuItem(f"⚠ {_truncate(rec.get('error', 'unknown'), 50)}")
-    if rec.get("permission_denied"):
-        item = rumps.MenuItem(f"⚠ {PERM_HINT}", callback=_open_screen_recording_settings)
-        return item
+    denied = (snap.permissions or {}).get("denied") or []
+    if denied:
+        p = denied[0]
+        return rumps.MenuItem(f"⚠ Not recording: {p['title']} is off", callback=_open_url_callback(p["settings_url"]))
+    if head == "recording_unknown":
+        why = UNKNOWN_REASONS.get(rec.get("reason"), rec.get("reason") or "unknown")
+        return rumps.MenuItem(f"? Can't tell whether a meeting is being recorded — {why}")
     if rec.get("recording"):
         f = rec.get("current_file")
         if rec.get("stale"):
-            age_s = rec.get("last_chunk_age_s", 0)
+            age_s = rec.get("last_chunk_age_s") or 0
             mins = max(1, age_s // 60)
             note = f"silent for {mins}m — another app likely capturing audio (Cluely / Loom / OBS)"
             if f:
@@ -177,6 +185,64 @@ def _build_status_line(snap: st.Snapshot) -> rumps.MenuItem:
             return rumps.MenuItem(f"● Recording{mode} — {Path(f).name}")
         return rumps.MenuItem(f"● Recording{mode}")
     return rumps.MenuItem(f"○ Idle{mode}")
+
+
+def _permission_lines(snap: st.Snapshot) -> list[rumps.MenuItem]:
+    """One row per permission the recorder needs and doesn't have, worded by
+    meeting-capture (`check --json`: its per-channel hint); a click opens
+    the right Privacy pane."""
+    out = []
+    for p in (snap.permissions or {}).get("problems") or []:
+        state = {"not_determined": "not asked yet", "denied": "off", "not_granted": "off"}.get(p["status"],
+                                                                                               p["status"])
+        text = f"⚠ {p['title']}: {state}" + (f" — {p['hint']}" if p.get("hint") else "")
+        out.append(rumps.MenuItem(_truncate(text, 110), callback=_open_url_callback(p.get("settings_url"))))
+    return out
+
+
+def _module_rows(snap: st.Snapshot) -> list[rumps.MenuItem]:
+    """Modules that aren't on: a greyed title, then the one way to add it
+    (brew: the install line, copied; app: turn it on). From
+    modules.menu_lines — the same rows the SwiftUI shell will draw."""
+    out = []
+    for line in modules.menu_lines(snap.modules) if snap.modules.get("modules") else []:
+        if line["id"] == "setup":
+            out.append(rumps.MenuItem("Set up Contorch…", callback=_copy_command_callback("contorch setup")))
+            continue
+        out.append(rumps.MenuItem(line["text"], callback=(
+            _copy_command_callback(line["action"]["command"]) if line.get("enabled") and line.get("action")
+            else None)))
+        add = line.get("add")
+        if add:
+            out.append(rumps.MenuItem(f"    {add['text'] if add['kind'] == 'action' else 'Copy: ' + add['command']}",
+                                      callback=_copy_command_callback(add["command"])))
+    return out
+
+
+def _copy_command_callback(command: str):
+    """Put a command on the clipboard and say where to run it (Phase 1: the
+    terminal; the app's own setup window comes later)."""
+    def _cb(_=None):
+        if copy_to_clipboard(command):
+            _notify("contorch", "Copied — paste it in Terminal", command)
+    return _cb
+
+
+def _attention_lines(snap: st.Snapshot) -> list[rumps.MenuItem]:
+    """The channel's attention codes (pipeline_monitor.channel.attention)."""
+    try:
+        claude = (snap.modules or {}).get("claude") or {}
+        items = chan.attention(recorder_backend=mcconfig.agent().get("backend") if snap.recorder_on() else None,
+                               mcp_present=(claude.get("mcp") or {}).get("present"),
+                               mcp_matches=(claude.get("mcp") or {}).get("matches"))
+    except Exception:
+        return []
+    words = {"interrupted": "A Contorch adopt/uninstall was interrupted — run it again to finish",
+             "owner_gone": "The install that managed Contorch here is gone — contorch adopt or uninstall",
+             "mixed_channels": "Parts of Contorch come from another install — contorch channel",
+             "brew_relinked": "Homebrew's Contorch commands are back on PATH — contorch channel",
+             "marker_unreadable": "~/.contorch/channel.json is unreadable — contorch channel"}
+    return [rumps.MenuItem(f"⚠ {words.get(a['code'], a['code'])}") for a in items]
 
 
 def _build_transcription_line(snap: st.Snapshot) -> rumps.MenuItem | None:
@@ -228,27 +294,27 @@ def _meeting_capture_bin() -> str | None:
 
 
 def _build_index_line(snap: st.Snapshot) -> rumps.MenuItem:
-    """One line summarising the chroma + sqlite state, and how search
-    understands questions (embedding model — or "keyword only" when off)."""
-    c = snap.chroma
+    """The memory, as context-orchestrator reports it (`contorch-memory
+    status --json`): documents, embeddings, keyword-only."""
+    m = snap.memory or {}
     d = snap.db
-    e = snap.embeddings or {}
-    if e.get("off"):
-        parts = ["keyword search only — embeddings off"]
-        if d.get("ok"):
-            parts.append(f"{d.get('repo_knowledge', 0)} insights")
-        return rumps.MenuItem("Index: " + " · ".join(parts))
-    if not c.get("ok"):
-        return rumps.MenuItem(f"⚠ Index: {_truncate(c.get('error', 'unreachable'), 50)}")
-    parts = [f"{c.get('doc_count', '?')} docs"]
-    if e.get("mode") == "gemini" and not e.get("has_key"):
-        parts.append("Gemini (no key → keyword only)")
-    elif e.get("mode"):
-        parts.append({"gemini": "Gemini", "local": "local model"}.get(e["mode"], e["mode"]))
+    if m.get("status") == "checking":
+        return rumps.MenuItem("Index: checking…")
+    data = m.get("data") or {}
+    if not m.get("ok"):
+        return rumps.MenuItem(f"⚠ Index: {_truncate(m.get('error') or 'unavailable', 70)}")
+    parts = []
+    if data.get("vector_index") == "none":
+        parts.append("keyword search only")
+    else:
+        parts.append(f"{data.get('docs') if data.get('docs') is not None else '?'} docs")
+        emb = data.get("embeddings") or "auto"
+        parts.append({"auto": "auto", "local": "local model"}.get(emb, "Gemini" if emb.startswith("gemini")
+                                                                   else emb))
+    if data.get("transcripts") is not None:
+        parts.append(f"{data['transcripts']} transcripts")
     if d.get("ok"):
         parts.append(f"{d.get('repo_knowledge', 0)} insights")
-        if d.get("last_repo_knowledge"):
-            parts.append(f"last {_ago(d['last_repo_knowledge'])}")
     return rumps.MenuItem("Index: " + " · ".join(parts))
 
 
@@ -285,17 +351,23 @@ def _build_mcp_lines(snap: st.Snapshot) -> list[rumps.MenuItem]:
 
 
 def _build_system_line(snap: st.Snapshot) -> rumps.MenuItem:
-    """One line: are the daemons up?"""
+    """What runs in the background. Memory is daemon-free (in-process
+    index); only the recorder is an agent."""
+    if not snap.recorder_on():
+        return rumps.MenuItem("Background: nothing runs")
+    rec = snap.recording or {}
+    if rec.get("source") == "owner":
+        if rec.get("pid") and rec.get("reason") != "daemon_not_running":
+            return rumps.MenuItem(f"Background: recorder running (pid {rec['pid']})")
+        if rec.get("reason") == "daemon_not_running":
+            return rumps.MenuItem("⚠ Background: the recorder isn't running")
     l = snap.launchd
     if not l.get("ok"):
         return rumps.MenuItem(f"⚠ launchctl: {_truncate(l.get('error', '?'), 50)}")
-    daemons = l.get("daemons", {})
-    installed = [info for info in daemons.values() if info.get("installed")]
-    running = [info for info in installed if info.get("running")]
-    if len(running) == len(installed) and installed:
-        return rumps.MenuItem(f"Daemons: {len(running)}/{len(installed)} up")
-    down = len(installed) - len(running)
-    return rumps.MenuItem(f"⚠ Daemons: {down} down ({len(running)}/{len(installed)} up)")
+    info = next((i for lbl, i in l.get("daemons", {}).items() if lbl.endswith("meeting-capture")), {})
+    if info.get("running"):
+        return rumps.MenuItem(f"Background: recorder running (pid {info['pid']})")
+    return rumps.MenuItem("⚠ Background: the recorder isn't running")
 
 
 def _build_recent_submenu(snap: st.Snapshot) -> rumps.MenuItem:
@@ -354,15 +426,16 @@ def _build_details_submenu(snap: st.Snapshot) -> rumps.MenuItem:
                 submenu.add(rumps.MenuItem(f"✗ {short} · stopped (exit {info.get('status')})"))
         submenu.add(rumps.separator)
 
-    # Chroma dim
-    c = snap.chroma
-    if c.get("ok"):
-        submenu.add(rumps.MenuItem(f"Chroma: {c.get('doc_count')} docs @ {c.get('dim')}d"))
-    e = snap.embeddings or {}
-    if e:
+    # The memory, as context-orchestrator reports it
+    m = (snap.memory or {}).get("data") or {}
+    if m:
         submenu.add(rumps.MenuItem(
-            "Embeddings: off (keyword search only)" if e.get("off")
-            else f"Embeddings: {e.get('mode')} (setting: {e.get('configured')})"))
+            f"Index: {m.get('vector_index')} · {m.get('docs')} docs · embeddings {m.get('embeddings')}"))
+        submenu.add(rumps.MenuItem(
+            f"chromadb {m.get('chromadb_version')} (index written by {m.get('index_written_by') or 'unknown'}"
+            f"{'' if m.get('index_compatible', True) else ' — NOT compatible'})"))
+    for row in (snap.modules or {}).get("modules") or []:
+        submenu.add(rumps.MenuItem(f"Module {row['title']}: {row['state']}"))
     for line in _transcription_details(snap):
         submenu.add(rumps.MenuItem(line))
 
@@ -528,8 +601,11 @@ class PipelineMonitor(rumps.App):
         self._repaint()
 
     def _on_refresh_now(self, _):
+        from . import ownerstate
+        ownerstate.clear()
         self._refresh_callback(None)
-        rumps.notification("pipeline-monitor", "Refreshed", f"chroma={self._snap.chroma.get('doc_count','?')} docs")
+        docs = ((self._snap.memory or {}).get("data") or {}).get("docs", "?")
+        _notify("pipeline-monitor", "Refreshed", f"{docs} docs in the index")
 
     def _on_smoke_test(self, _):
         # rumps.notification silently no-ops when Python isn't running as a
@@ -537,16 +613,13 @@ class PipelineMonitor(rumps.App):
         # alert + osascript notification so the result is always visible,
         # and mirror to stderr so it lands in the launchd log.
         import sys
-        _notify("pipeline-monitor", "Running smoke test", "End-to-end pipeline check…")
+        from .diagnostics import smoke
+        _notify("pipeline-monitor", "Running smoke test", "End-to-end memory check…")
         print("[smoke] starting…", file=sys.stderr, flush=True)
-        result = run_smoke_test()
+        result = smoke()
         print(f"[smoke] result: {result}", file=sys.stderr, flush=True)
-        if result["ok"]:
-            title = "Smoke test passed"
-            body = f"{result['duration_ms']}ms · {result['summary']}"
-        else:
-            title = "Smoke test FAILED"
-            body = f"stage={result.get('stage','?')} · {result.get('error','unknown')[:200]}"
+        title = "Smoke test passed" if result["ok"] else "Smoke test FAILED"
+        body = result["summary"]
         _notify("pipeline-monitor", title, body)
         # Modal so the user always sees the result even if Notification Center
         # is muted / Focus is on / app lacks notification permission.
@@ -601,22 +674,32 @@ class PipelineMonitor(rumps.App):
         else:
             rumps.notification("pipeline-monitor", "No MCP log", "Server may not have run yet")
 
-    def _on_restart_chroma(self, _):
-        # com.stirredo.* → com.contorch.* rebrand: use whichever plist exists.
-        for org in ("contorch", "stirredo"):
-            plist = Path.home() / f"Library/LaunchAgents/com.{org}.context-orchestrator-chroma.plist"
-            if plist.exists():
-                break
-        else:
-            rumps.notification("pipeline-monitor", "Plist missing", str(plist))
-            return
-        try:
-            subprocess.run(["launchctl", "unload", str(plist)], capture_output=True, timeout=3)
-            subprocess.run(["launchctl", "load", str(plist)], capture_output=True, timeout=3)
-            rumps.notification("pipeline-monitor", "Chroma daemon restarted", "Reload triggered")
-        except Exception as e:
-            rumps.notification("pipeline-monitor", "Restart failed", str(e))
-        self._refresh_callback(None)
+    def _on_import_transcripts(self, _):
+        """Memory-only Macs: import a transcript bundle made on the recording
+        Mac (`contorch-transcripts export`/`embed`). The file chooser is
+        osascript's `choose file` (no Automation permission needed); the
+        import is context-orchestrator's `contorch-transcripts import --json`."""
+        from . import owners as ow
+
+        def _run():
+            pick = subprocess.run(["osascript", "-e", 'POSIX path of (choose file with prompt '
+                                   '"Import transcripts (a bundle or a folder of .md files)")'],
+                                  capture_output=True, text=True, timeout=600)
+            path = pick.stdout.strip()
+            if pick.returncode != 0 or not path:
+                return
+            res = ow.call("contorch-transcripts", "import", path, "--json", timeout=1800)
+            d = res.get("data") or {}
+            if res["status"] == "ok" and d.get("ok", True) and d.get("event", "result") == "result":
+                how = " (keyword search: this Mac has no matching embedding key)" \
+                    if d.get("embeddings") == "keyword_only" else ""
+                _notify("contorch", "Transcripts imported",
+                        f"{d.get('imported', 0)} imported, {d.get('skipped', 0)} already here{how}")
+            else:
+                msg = (d.get("error") or {}).get("message") if isinstance(d.get("error"), dict) else res.get("error")
+                _notify("contorch", "Import failed", _truncate(str(msg or "unknown error"), 200))
+            AppHelper.callAfter(self._refresh_callback, None)
+        threading.Thread(target=_run, name="import-transcripts", daemon=True).start()
 
     def _on_quit(self, _):
         rumps.quit_application()
@@ -685,9 +768,15 @@ class PipelineMonitor(rumps.App):
         self.menu.clear()
 
         self.menu.add(_build_status_line(snap))
-        tline = _build_transcription_line(snap)
-        if tline is not None:
-            self.menu.add(tline)
+        recorder = snap.recorder_on()
+        if recorder:
+            for line in _permission_lines(snap):
+                self.menu.add(line)
+            tline = _build_transcription_line(snap)
+            if tline is not None:
+                self.menu.add(tline)
+        for line in _attention_lines(snap) + _module_rows(snap):
+            self.menu.add(line)
         self.menu.add(rumps.separator)
 
         self.menu.add(_build_index_line(snap))
@@ -707,15 +796,17 @@ class PipelineMonitor(rumps.App):
         # an "Open" submenu so the bottom of the menu doesn't sprawl.
         self.menu.add(rumps.MenuItem("Refresh", callback=self._on_refresh_now))
         self.menu.add(rumps.MenuItem("Run smoke test", callback=self._on_smoke_test))
+        if recorder:     # the recorder's own actions only when this Mac records
+            self.menu.add(rumps.MenuItem("Start new meeting", callback=self._on_new_meeting))
+            self.menu.add(rumps.MenuItem("Recording settings…", callback=self._on_recording_settings))
+            self.menu.add(self._build_mode_toggle(snap))
+        else:
+            self.menu.add(rumps.MenuItem("Import transcripts…", callback=self._on_import_transcripts))
         open_submenu = rumps.MenuItem("Open")
         open_submenu.add(rumps.MenuItem("Latest transcript", callback=self._on_open_latest_transcript))
         open_submenu.add(rumps.MenuItem("~/.context-orchestrator", callback=self._on_open_co_dir))
         open_submenu.add(rumps.MenuItem("MCP log", callback=self._on_open_mcp_log))
         self.menu.add(open_submenu)
-        self.menu.add(rumps.MenuItem("Restart chroma", callback=self._on_restart_chroma))
-        self.menu.add(rumps.MenuItem("Start new meeting", callback=self._on_new_meeting))
-        self.menu.add(rumps.MenuItem("Recording settings…", callback=self._on_recording_settings))
-        self.menu.add(self._build_mode_toggle(snap))
         self.menu.add(self._build_stack_toggle())
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Quit", callback=self._on_quit))

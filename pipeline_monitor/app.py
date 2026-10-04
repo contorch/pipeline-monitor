@@ -17,6 +17,7 @@ import threading
 import time
 import webbrowser
 from datetime import datetime
+from importlib import resources
 from pathlib import Path
 from typing import Optional
 
@@ -63,24 +64,18 @@ def _prune_menu_refs(menu) -> None:
 
 
 def _notify(app: str, title: str, body: str) -> None:
-    """Best-effort macOS notification via osascript. Works without a signed
-    .app bundle (unlike rumps.notification, which silently no-ops in that
-    case). Failures are swallowed — notifications are optional UX."""
-    def _esc(s: str) -> str:
-        return s.replace("\\", "\\\\").replace('"', '\\"')
-    script = (
-        f'display notification "{_esc(body)}" '
-        f'with title "{_esc(app)}" subtitle "{_esc(title)}"'
-    )
-    try:
-        subprocess.run(["osascript", "-e", script], timeout=3, check=False)
-    except Exception:
-        pass
+    """Best-effort notification: UNUserNotificationCenter inside Contorch.app,
+    osascript elsewhere (rumps.notification silently no-ops without a signed
+    bundle). See pipeline_monitor.notify."""
+    from .notify import post
+    post(app, title, body)
 
-# Icon assets live alongside the package, two levels up from app.py
-# (repo_root/assets/) so the build-menubar-icons script can regenerate
-# them without touching the package itself.
-ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
+
+# Icon assets are package data (pipeline_monitor/assets/*.png, listed in
+# pyproject's package-data), so a wheel — brew's venv, the app bundle — has
+# them. They used to sit in the repo root, which no install contains, so the
+# menu bar fell back to a text "○". Regenerate with assets/build-menubar-icons.py.
+ASSETS_DIR = Path(str(resources.files(__package__) / "assets"))
 GLYPH_TEMPLATE = ASSETS_DIR / "glyph-template.png"
 GLYPH_TEMPLATE_PULSE = ASSETS_DIR / "glyph-template-pulse.png"
 GLYPH_REC = ASSETS_DIR / "glyph-rec.png"

@@ -1,6 +1,6 @@
 """Generate macOS menu bar icon variants from the master Contorch logo.
 
-Outputs (all in this directory):
+Outputs (in pipeline_monitor/assets/, shipped in the wheel as package data):
   glyph-template.png         — solid-black silhouette of the C-flame on
                                transparent. Used as `template_image` in
                                rumps so macOS auto-tints it light/dark
@@ -19,8 +19,9 @@ colour itself is irrelevant; what matters is the shape mask.
 from pathlib import Path
 from PIL import Image, ImageDraw
 
-ASSETS = Path(__file__).resolve().parent
-SRC = ASSETS / "contorch-orange.png"
+SRC = Path(__file__).resolve().parent / "contorch-orange.png"
+# The menu bar loads them with importlib.resources, so they live in the package.
+ASSETS = Path(__file__).resolve().parent.parent / "pipeline_monitor" / "assets"
 
 TARGET_SIZE = 44  # 22pt @ 2x retina
 

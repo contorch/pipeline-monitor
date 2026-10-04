@@ -8,6 +8,11 @@ dependencies = [
     "httpx>=0.27.0",
 ]
 
+[project.optional-dependencies]
+# Inside Contorch.app: notifications through UNUserNotificationCenter.
+app = ["pyobjc-framework-UserNotifications; sys_platform == 'darwin'"]
+dev = ["pytest"]
+
 [project.scripts]
 pipeline-monitor = "pipeline_monitor.app:main"
 contorch = "pipeline_monitor.contorch:main"
@@ -19,3 +24,7 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["pipeline_monitor*"]
+
+[tool.setuptools.package-data]
+# The menu bar icons (loaded with importlib.resources; tests/test_wheel.py).
+pipeline_monitor = ["assets/*.png"]

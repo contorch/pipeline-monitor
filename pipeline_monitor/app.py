@@ -26,7 +26,6 @@ from AppKit import NSObject
 from PyObjCTools import AppHelper  # noqa: F401  (ensures AppKit init order)
 
 from . import contorch as ct
-from . import notify
 from . import status as st
 from . import transcription as stt
 from .smoketest import run_smoke_test
@@ -68,7 +67,8 @@ def _notify(app: str, title: str, body: str) -> None:
     """Best-effort notification: UNUserNotificationCenter inside Contorch.app,
     osascript elsewhere (rumps.notification silently no-ops without a signed
     bundle). See pipeline_monitor.notify."""
-    notify.post(app, title, body)
+    from .notify import post
+    post(app, title, body)
 
 
 # Icon assets are package data (pipeline_monitor/assets/*.png, listed in

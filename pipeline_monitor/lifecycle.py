@@ -136,8 +136,12 @@ def location() -> str:
     path = str(root)
     if "/AppTranslocation/" in path:
         return "translocated"
+    # Read-only = the volume (the DMG). NOT os.access(path, W_OK): macOS's App Management
+    # protection (com.apple.macl on a launched, notarized bundle) makes access() say "not
+    # writable" for every installed copy, which would turn off Sparkle and the login item in
+    # /Applications (measured on macOS 27 with a notarized labtest build).
     try:
-        if os.statvfs(path).f_flag & os.ST_RDONLY or not os.access(path, os.W_OK):
+        if os.statvfs(path).f_flag & os.ST_RDONLY:
             return "read_only"
     except OSError:
         return "read_only"

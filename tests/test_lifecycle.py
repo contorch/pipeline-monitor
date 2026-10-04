@@ -284,3 +284,25 @@ def test_move_to_applications_when_already_there_is_a_noop(tmp_path, monkeypatch
 def test_move_outside_the_app(monkeypatch):
     monkeypatch.setattr(owners, "bundle_root", lambda executable=None: None)
     assert lifecycle.move_to_applications()["error"]["code"] == "not_in_app"
+
+
+def test_location_ignores_access_on_an_installed_bundle(tmp_path, monkeypatch):
+    """App Management makes access(W_OK) False for a launched notarized bundle in
+    /Applications; that copy is still where Contorch belongs."""
+    app = tmp_path / "Applications" / "Contorch.app"
+    app.mkdir(parents=True)
+    monkeypatch.setattr(owners, "bundle_root", lambda executable=None: app)
+    monkeypatch.setattr(lifecycle.os, "access", lambda *a, **k: False)
+    monkeypatch.setattr(lifecycle.Path, "home", classmethod(lambda cls: tmp_path))
+    assert lifecycle.location() == "ok"
+
+
+def test_location_read_only_volume(tmp_path, monkeypatch):
+    app = tmp_path / "Volumes" / "Contorch" / "Contorch.app"
+    app.mkdir(parents=True)
+    monkeypatch.setattr(owners, "bundle_root", lambda executable=None: app)
+
+    class V:
+        f_flag = lifecycle.os.ST_RDONLY
+    monkeypatch.setattr(lifecycle.os, "statvfs", lambda p: V())
+    assert lifecycle.location() == "read_only"

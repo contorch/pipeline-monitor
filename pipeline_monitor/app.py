@@ -594,9 +594,27 @@ class PipelineMonitor(rumps.App):
         except Exception:
             pass
 
+        # Launch policy is Python's (lifecycle.on_launch): resume a stack a
+        # quit or an update stopped, in every channel. Off the main thread:
+        # starting the recorder can take a few seconds.
+        def _launch():
+            from . import lifecycle
+            try:
+                res = lifecycle.on_launch()
+                print(f"[lifecycle] on_launch: {res}", file=__import__("sys").stderr, flush=True)
+            except Exception as e:  # noqa: BLE001 — never keep the menu from starting
+                print(f"[lifecycle] on_launch failed: {e!r}", file=__import__("sys").stderr, flush=True)
+            AppHelper.callAfter(self._refresh_callback, None)
+        threading.Thread(target=_launch, name="on-launch", daemon=True).start()
+
     # ----- callbacks -----
 
     def _refresh_callback(self, _):
+        from . import lifecycle
+        key = lifecycle.watch_key()          # setup (in Terminal) wrote channel/modules/preferences
+        if key != getattr(self, "_watch", None):
+            self._watch = key
+            stt.clear_cache()
         self._snap = st.collect()
         self._repaint()
 
@@ -808,6 +826,9 @@ class PipelineMonitor(rumps.App):
         open_submenu.add(rumps.MenuItem("MCP log", callback=self._on_open_mcp_log))
         self.menu.add(open_submenu)
         self.menu.add(self._build_stack_toggle())
+        keep = self._build_keep_recording(snap)
+        if keep is not None:
+            self.menu.add(keep)
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Quit", callback=self._on_quit))
 
@@ -874,6 +895,21 @@ class PipelineMonitor(rumps.App):
             return rumps.MenuItem("Resume everything", callback=lambda _: self._on_stack("resume"))
         return rumps.MenuItem("Stop everything", callback=lambda _: self._on_stack("stop"))
 
+    def _build_keep_recording(self, snap: st.Snapshot) -> rumps.MenuItem | None:
+        """"Keep recording after Quit" (lifecycle preference); hidden on a
+        Mac that doesn't record."""
+        from . import lifecycle
+        if not (snap.capture_mode or {}).get("installed"):
+            return None
+        item = rumps.MenuItem("Keep recording after Quit", callback=self._on_keep_recording)
+        item.state = 1 if lifecycle.keep_recording_after_quit() else 0
+        return item
+
+    def _on_keep_recording(self, sender):
+        from . import lifecycle
+        lifecycle.set_keep_recording_after_quit(not lifecycle.keep_recording_after_quit())
+        self._refresh_callback(None)
+
     def _on_stack(self, action: str):
         self._stack_busy = "Stopping" if action == "stop" else "Resuming"
         self._refresh_callback(None)
@@ -898,7 +934,63 @@ class PipelineMonitor(rumps.App):
         threading.Thread(target=_run, name=f"contorch-{action}", daemon=True).start()
 
 
+# ============================================================ quit (lifecycle.on_quit)
+#
+# Every way out goes through one Python decision: the Quit item and a quit
+# Apple Event reach rumps' before_quit; SIGTERM (brew services stop/restart,
+# brew upgrade, launchctl bootout) doesn't, so its handler routes it to the
+# same quit. A quit Apple Event carrying kAEQuitReason ('why?') is a logout,
+# restart or shutdown: launchd stops the agents then, nothing to do.
+
+_QUIT_REASON = {"value": "user"}
+_KEEP: dict = {}
+K_AE_QUIT_REASON = 0x7768793F          # 'why?'
+
+
+def quit_reason() -> str:
+    reason = _QUIT_REASON["value"]
+    try:
+        from Foundation import NSAppleEventManager
+        ev = NSAppleEventManager.sharedAppleEventManager().currentAppleEvent()
+        if ev is not None and ev.attributeDescriptorForKeyword_(K_AE_QUIT_REASON) is not None:
+            return "logout"
+    except Exception:
+        pass
+    return reason
+
+
+def _before_quit() -> None:
+    from . import lifecycle
+    try:
+        res = lifecycle.on_quit(quit_reason())
+        print(f"[lifecycle] on_quit: {res}", file=__import__("sys").stderr, flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[lifecycle] on_quit failed: {e!r}", file=__import__("sys").stderr, flush=True)
+
+
+def install_sigterm() -> None:
+    """SIGTERM → the normal quit path. Python runs a signal handler on the
+    main thread the next time it executes bytecode; a 0.25 s NSTimer keeps
+    that prompt while the run loop idles (PROVEN within 0.25 s)."""
+    import signal
+    from Foundation import NSTimer
+
+    def _handler(signum, frame):
+        _QUIT_REASON["value"] = "signal"
+        rumps.quit_application()
+    signal.signal(signal.SIGTERM, _handler)
+
+    class _Tick(NSObject):
+        def tick_(self, t):
+            pass
+    _KEEP["tick"] = _Tick.alloc().init()
+    NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(0.25, _KEEP["tick"], b"tick:", None,
+                                                                             True)
+
+
 def main():
+    rumps.events.before_quit.register(_before_quit)
+    install_sigterm()
     PipelineMonitor().run()
 
 

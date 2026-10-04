@@ -124,51 +124,124 @@ def status() -> list[dict]:
     return rows
 
 
-def stop(log=print) -> bool:
+STOP_REASONS = ("user", "quit", "update")      # stopped.json "reason"; only quit/update auto-resume
+
+
+def _recorder_verb(verb: str, reason: str | None, log) -> bool | None:
+    """The recorder goes through meeting-capture (`stop|start --json
+    [--reason]`; its supervisor handles either backend, the app's
+    SMAppService agent included). None when this meeting-capture predates
+    the verbs (0.7) or isn't installed: the caller falls back to launchctl
+    for its legacy plist."""
+    if owners.locate("meeting-capture") is None:
+        return None
+    args = [verb, *(["--reason", reason] if verb == "stop" and reason else []), "--json"]
+    res = owners.call("meeting-capture", *args, schema="meeting-capture.agent/", timeout=120)
+    if res["status"] == "old":
+        return None
+    if res["status"] != "ok":
+        log(f"  ✗ meeting capture: {res['error']}")
+        return False
+    d = res["data"]
+    if not d.get("ok"):
+        log(f"  ✗ meeting capture: {(d.get('error') or {}).get('message')}")
+        return False
+    if d.get("performed") or d.get("why") is None:
+        log(f"  {'■' if verb == 'stop' else '▶'} meeting capture {'stopped' if verb == 'stop' else 'running'}")
+    else:
+        log(f"  · meeting capture: {d.get('why')}")
+    return True
+
+
+def _launchctl_stop(a: dict, log) -> bool:
+    target = f"gui/{_uid()}/{a['label']}"
+    _launchctl("disable", target)          # stays stopped across login
+    res = _launchctl("bootout", target)    # SIGTERM; the daemons shut down cleanly
+    # 3 / 113 / "No such process": already not running — fine.
+    if res.returncode not in (0, 3, 36, 113) and "No such process" not in res.stderr:
+        log(f"  ✗ {a['desc']}: {res.stderr.strip() or res.returncode}")
+        return False
+    log(f"  ■ {a['desc']} stopped")
+    return True
+
+
+def stop(log=print, reason: str = "user") -> bool:
+    """Stop the recorder (meeting-capture's own `stop --json --reason`) and
+    any retired agent an older install left (launchctl, legacy labels only),
+    and remember why in ~/.contorch/stopped.json: a user's stop stays until
+    `contorch resume`; a quit or an update resumes on the next launch."""
+    reason = reason if reason in STOP_REASONS else "user"
     found = agents()
-    if not found:
+    rec = _recorder_verb("stop", reason, log)
+    legacy = [a for a in found if not (a["component"] == "meeting-capture" and rec is not None)]
+    if rec is None and not found:
         log("No contorch daemons are installed.")
         return False
-    ok = True
-    for a in found:
-        target = f"gui/{_uid()}/{a['label']}"
-        _launchctl("disable", target)          # stays stopped across login
-        res = _launchctl("bootout", target)    # SIGTERM; the daemons shut down cleanly
-        # 3 / 113 / "No such process": already not running — fine.
-        if res.returncode not in (0, 3, 36, 113) and "No such process" not in res.stderr:
-            ok = False
-            log(f"  ✗ {a['desc']}: {res.stderr.strip() or res.returncode}")
-            continue
-        log(f"  ■ {a['desc']} stopped")
+    ok = rec is not False
+    for a in legacy:
+        ok = _launchctl_stop(a, log) and ok
     # launchd reports success before the process has actually exited.
     for _ in range(10):
-        if not any(_pid(a["label"]) for a in found):
+        if not any(_pid(a["label"]) for a in legacy):
             break
         time.sleep(0.5)
-    still = [a["desc"] for a in found if _pid(a["label"])]
+    still = [a["desc"] for a in legacy if _pid(a["label"])]
     if still:
         ok = False
         log(f"  ✗ still running: {', '.join(still)}")
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STOPPED_MARKER.write_text(json.dumps({"at": time.time(), "labels": [a["label"] for a in found]}))
+    STOPPED_MARKER.write_text(json.dumps({"at": time.time(), "reason": reason,
+                                          "labels": [a["label"] for a in legacy]
+                                          + ([MC_LABEL] if rec is not None else [])}))
     return ok
 
 
+def stopped_reason() -> str | None:
+    """Why the stack is stopped (user | quit | update), None when it isn't.
+    A marker from before reasons existed counts as the user's."""
+    if not STOPPED_MARKER.is_file():
+        return None
+    try:
+        r = json.loads(STOPPED_MARKER.read_text()).get("reason")
+    except (OSError, ValueError):
+        r = None
+    return r if r in STOP_REASONS else "user"
+
+
 def _cli_stack(sub) -> None:
-    sub.add_parser("stop", help="stop every contorch daemon and keep them stopped across login").set_defaults(
-        func=_cmd_stop)
-    sub.add_parser("resume", help="start every contorch daemon again, in order").set_defaults(func=_cmd_resume)
+    for name, help_ in (("stop", "stop every contorch daemon and keep them stopped across login"),
+                        ("resume", "start every contorch daemon again, in order")):
+        p = sub.add_parser(name, help=help_)
+        p.add_argument("--json", action="store_true", help="one JSON document (contorch.stack/1)")
+        if name == "stop":
+            p.add_argument("--reason", choices=STOP_REASONS, default="user",
+                           help="why (quit/update resume on the next launch; user waits for `contorch resume`)")
+        p.set_defaults(func=_cmd_stop if name == "stop" else _cmd_resume)
+
+
+def _stack_json(action: str, fn, **kw) -> int:
+    from . import jsonout
+    lines: list[str] = []
+    with jsonout.reserved_stdout() as out:
+        ok = fn(log=lines.append, **kw)
+        jsonout.emit({"schema": "contorch.stack/1", "ok": ok, "action": action, **kw,
+                      "stopped": is_stopped(), "reason": stopped_reason(), "lines": lines}, out)
+    return 0 if ok else 1
 
 
 def _cmd_stop(args) -> int:
+    if args.json:
+        return _stack_json("stop", stop, reason=args.reason)
     print("Stopping contorch…")
-    ok = stop()
+    ok = stop(reason=args.reason)
     print("\nStopped. Nothing records, indexes, or answers searches until `contorch resume`."
           if ok else "\nStopped with errors (above).")
     return 0 if ok else 1
 
 
 def _cmd_resume(args) -> int:
+    if args.json:
+        return _stack_json("resume", resume)
     print("Resuming contorch…")
     ok = resume()
     print("\nRunning." if ok else "\nResumed with errors (above). `contorch status` for details.")
@@ -176,37 +249,54 @@ def _cmd_resume(args) -> int:
 
 
 def resume(log=print) -> bool:
+    """Start what stop() stopped, index first: a retired chroma server an
+    older install still has (launchctl), then the recorder through
+    meeting-capture (`start --json`: it re-enables a job a legacy stop
+    disabled). meeting-capture 0.7: launchctl, as before."""
     found = list(reversed(agents()))  # index first, capture last
-    if not found:
+    has_mc = owners.locate("meeting-capture") is not None
+    if not found and not has_mc:
         log("No contorch daemons are installed.")
         return False
     ok = True
     for a in found:
-        target = f"gui/{_uid()}/{a['label']}"
-        _launchctl("enable", target)
-        if _pid(a["label"]) is None:
-            res = _launchctl("bootstrap", f"gui/{_uid()}", str(a["plist"]))
-            # 5 / 17 / 37: already loaded (e.g. loaded but not running) — kick it instead.
-            if res.returncode != 0:
-                _launchctl("kickstart", target)
-        if a["component"] == "context-orchestrator-chroma":
-            if _chroma_up(60):
-                log(f"  ▶ {a['desc']} running")
-            else:
-                ok = False
-                log(f"  ✗ {a['desc']} did not answer its heartbeat within 60s")
+        if a["component"] == "meeting-capture":
             continue
-        for _ in range(20):
-            if _pid(a["label"]):
-                break
-            time.sleep(0.5)
-        if _pid(a["label"]):
-            log(f"  ▶ {a['desc']} running")
-        else:
-            ok = False
-            log(f"  ✗ {a['desc']} did not start — see its log")
+        ok = _launchctl_start(a, log) and ok
+    rec = _recorder_verb("start", None, log) if has_mc else None
+    if rec is None:
+        for a in found:
+            if a["component"] == "meeting-capture":
+                ok = _launchctl_start(a, log) and ok
+    else:
+        ok = rec and ok
     STOPPED_MARKER.unlink(missing_ok=True)
     return ok
+
+
+def _launchctl_start(a: dict, log) -> bool:
+    target = f"gui/{_uid()}/{a['label']}"
+    _launchctl("enable", target)
+    if _pid(a["label"]) is None:
+        res = _launchctl("bootstrap", f"gui/{_uid()}", str(a["plist"]))
+        # 5 / 17 / 37: already loaded (e.g. loaded but not running) — kick it instead.
+        if res.returncode != 0:
+            _launchctl("kickstart", target)
+    if a["component"] == "context-orchestrator-chroma":
+        if _chroma_up(60):
+            log(f"  ▶ {a['desc']} running")
+            return True
+        log(f"  ✗ {a['desc']} did not answer its heartbeat within 60s")
+        return False
+    for _ in range(20):
+        if _pid(a["label"]):
+            break
+        time.sleep(0.5)
+    if _pid(a["label"]):
+        log(f"  ▶ {a['desc']} running")
+        return True
+    log(f"  ✗ {a['desc']} did not start — see its log")
+    return False
 
 
 # ------------------------------------------------------------------ setup

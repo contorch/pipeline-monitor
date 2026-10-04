@@ -8,6 +8,9 @@
     contorch channel    which install (app / brew / dev) owns Contorch on this Mac
     contorch modules    memory, recorder, line-in, terminal commands: present / wanted / on
     contorch cli        put Contorch.app's commands on your PATH (app only)
+    contorch adopt      make this install own Contorch here (backs up your data first)
+    contorch rollback   Contorch.app: go back to the Homebrew install it adopted
+    contorch uninstall  remove Contorch (your meetings and memory are kept)
 
 The daemons are per-user launchd agents written by each component's own
 installer (meeting-capture, context-orchestrator's chroma server and

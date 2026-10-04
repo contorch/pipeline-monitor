@@ -201,3 +201,9 @@ def test_observe_reads_owner_json(tmp_path, monkeypatch, fake_mc):
     obs = M.observe("dev")
     assert obs["memory"] is True
     assert obs["recorder"] is False                              # no plist, no config doc
+
+
+def test_brews_always_on_cli_alone_is_not_an_install_to_migrate():
+    """Homebrew always provides the cli module; that alone mustn't read as a
+    set-up, memory-only Mac (setup would then default to 'don't record')."""
+    assert M.infer_wanted({"memory": False, "recorder": False, "linein": False, "cli": True}) is None

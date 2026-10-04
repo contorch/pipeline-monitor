@@ -143,8 +143,9 @@ def embeddings_source() -> str | None:
 
 def infer_wanted(actual: dict[str, bool | None]) -> dict[str, bool] | None:
     """Migration for installs made before modules existed: what is set up is
-    what was wanted. None when nothing is set up (a fresh Mac)."""
-    if not any(actual.get(m) for m in ORDER):
+    what was wanted. None when nothing is set up (a fresh Mac). The cli
+    module alone doesn't count: Homebrew always provides it."""
+    if not any(actual.get(m) for m in ("memory", "recorder", "linein")):
         return None
     w = {m: bool(actual.get(m)) for m in ORDER}
     for m in ORDER:                      # keep the requirement graph consistent

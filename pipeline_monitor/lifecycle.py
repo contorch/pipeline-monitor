@@ -12,8 +12,12 @@ decides, the shells (rumps today, SwiftUI later) only report the event.
                        entries through `contorch-memory claude install` when
                        its status isn't ok) — only while meeting-capture says
                        nothing is being recorded — and whether to offer setup.
-    on_quit(reason)    reason user | signal | logout | update. logout: launchd
-                       takes the agents down, nothing to do. update (or an
+    on_quit(reason)    reason user | signal | logout | update | handover.
+                       logout: launchd takes the agents down, nothing to do.
+                       handover: another install takes over (Move to
+                       Applications… started the copy; Go back to Homebrew
+                       and Uninstall already stopped what they own), nothing
+                       to do. update (or an
                        update staged to install on quit): always stop
                        (reason=update). user / signal: stop (reason=quit)
                        unless "Keep recording after Quit" is on.
@@ -21,6 +25,9 @@ decides, the shells (rumps today, SwiftUI later) only report the event.
                        `meeting-capture status --json` says recording: false;
                        recording, and can't-tell, hold it.
     prepare_update()   stop the stack (reason=update) before the swap.
+    move_to_applications()  copy the running app into /Applications (or
+                       ~/Applications), the way "Move to Applications…" does
+                       it; the menu then opens the copy and quits.
 
 Preferences (~/.contorch/preferences.json, `contorch preferences …`):
     keep_recording_after_quit   default: app off (Quit stops recording);
@@ -32,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -39,7 +47,7 @@ from typing import Any
 from . import channel as chan
 from . import modules, owners
 
-QUIT_REASONS = ("user", "signal", "logout", "update")
+QUIT_REASONS = ("user", "signal", "logout", "update", "handover")
 FEEDS = ("stable", "beta")
 update_staged = False            # set by the Sparkle delegate (willInstallUpdateOnQuit; M4)
 
@@ -128,8 +136,12 @@ def location() -> str:
     path = str(root)
     if "/AppTranslocation/" in path:
         return "translocated"
+    # Read-only = the volume (the DMG). NOT os.access(path, W_OK): macOS's App Management
+    # protection (com.apple.macl on a launched, notarized bundle) makes access() say "not
+    # writable" for every installed copy, which would turn off Sparkle and the login item in
+    # /Applications (measured on macOS 27 with a notarized labtest build).
     try:
-        if os.statvfs(path).f_flag & os.ST_RDONLY or not os.access(path, os.W_OK):
+        if os.statvfs(path).f_flag & os.ST_RDONLY:
             return "read_only"
     except OSError:
         return "read_only"
@@ -182,6 +194,8 @@ def on_quit(reason: str) -> dict[str, Any]:
         action = "none (already stopped)"
     elif reason == "logout":
         action = "none (logout: launchd stops the agents; nothing is persisted)"
+    elif reason == "handover":
+        action = "none (handed over: another install, or nothing, takes over)"
     elif not recorder_installed():
         action = "none (this Mac doesn't record)"
     elif reason == "update" or update_staged:
@@ -210,6 +224,61 @@ def prepare_update() -> bool:
     if ct.is_stopped() and ct.stopped_reason() == "user":
         return True                      # stays the user's stop
     return ct.stop(log=lambda _m: None, reason="update")
+
+
+def applications_dir() -> Path:
+    """/Applications when this user may write there, else ~/Applications."""
+    sys_apps = Path("/Applications")
+    return sys_apps if os.access(sys_apps, os.W_OK) else Path.home() / "Applications"
+
+
+def _run(argv: list[str], timeout: float = 600) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+
+
+def _trash(path: Path) -> bool:
+    """Move an older copy to the Trash (recoverable), the way Finder would."""
+    try:
+        from Foundation import NSFileManager, NSURL
+        ok, _url, _err = NSFileManager.defaultManager().trashItemAtURL_resultingItemURL_error_(
+            NSURL.fileURLWithPath_(str(path)), None, None)
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def move_to_applications(dest_dir: Path | None = None) -> dict[str, Any]:
+    """Copy the running Contorch.app into Applications.
+
+    -> {ok, dest, replaced?} | {ok: False, error: {code, message}}
+    An older copy already there goes to the Trash first (an update by hand).
+    The copy loses com.apple.quarantine: Gatekeeper already approved this app
+    when it first opened, and a copy that keeps the attribute would be
+    translocated again. Nothing is registered from here: the copy's own
+    on_launch does that."""
+    root = owners.bundle_root()
+    if root is None:
+        return {"ok": False, "error": {"code": "not_in_app", "message": "not running from Contorch.app"}}
+    dest_dir = dest_dir or applications_dir()
+    dest = dest_dir / root.name
+    try:
+        if dest.resolve() == root.resolve():
+            return {"ok": True, "dest": str(dest), "noop": True}
+    except OSError:
+        pass
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    replaced = False
+    if dest.exists():
+        if not _trash(dest):
+            return {"ok": False, "error": {"code": "exists",
+                                           "message": f"{dest} already exists and couldn't be moved to the "
+                                                      "Trash — quit it and delete it, then try again"}}
+        replaced = True
+    res = _run(["ditto", str(root), str(dest)])
+    if res.returncode != 0:
+        return {"ok": False, "error": {"code": "copy_failed", "message": (res.stderr or res.stdout).strip()[-300:]}}
+    _run(["xattr", "-dr", "com.apple.quarantine", str(dest)], timeout=120)
+    return {"ok": True, "dest": str(dest), "replaced": replaced}
 
 
 def watch_key() -> tuple:

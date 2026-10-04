@@ -1030,7 +1030,17 @@ def _menu_bar(log, todo: list, me: str) -> None:
                 todo.append("Start the menu bar: brew services start contorch/tap/contorch")
             return
     if me == "app":
-        log("  · Contorch.app starts itself at login (System Settings › General › Login Items)")
+        from . import loginitem
+        res = loginitem.register()       # SMAppService.mainApp; only from a copy in Applications
+        if res["ok"]:
+            log("  ✓ Contorch opens at login (System Settings › General › Login Items)")
+        elif res["status"] == "requires_approval":
+            log("  ! Contorch is turned off in System Settings › General › Login Items")
+            todo.append("Turn Contorch on in System Settings › General › Login Items (to start it at login)")
+        else:
+            msg = (res.get("error") or {}).get("message") or res["status"]
+            log(f"  ! Open at Login wasn't turned on: {msg}")
+            todo.append(f"Turn on Open at Login from the Contorch menu ({msg})")
         try:
             from .notify import request_authorization
             request_authorization()            # asked once, here

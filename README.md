@@ -104,6 +104,16 @@ Three independent daemons (chroma, transcript-watcher, meeting-capture) plus an 
 - **Is Claude Code actually using the auto-context hook + MCP search?**
 - **Are any of the daemons down?**
 
+## Quit, launch, updates (`pipeline_monitor/lifecycle.py`)
+
+Python decides; the menu bar only reports the event.
+
+- **Quit** (`on_quit(reason)`): the Quit item and a quit Apple Event reach rumps' `before_quit`; **SIGTERM** (`brew services stop|restart`, `brew upgrade`, `launchctl bootout`) is routed to the same quit (a handler plus a 0.25 s timer). A quit Apple Event with `kAEQuitReason` is a logout: nothing to do. An update always stops the recorder (`contorch stop --reason update`). Otherwise the recorder stops (`--reason quit`) unless **Keep recording after Quit** is on — default off in Contorch.app, on with Homebrew/source (today's behaviour). The menu has the checkbox (hidden on a Mac that doesn't record); `contorch preferences set keep-recording-after-quit on|off`.
+- **Launch** (`on_launch()`): in **every** channel, a stack stopped by a quit or an update is resumed — a user's "Stop everything" is not. So `brew upgrade` with keep-recording off doesn't leave the recorder off. Inside Contorch.app only: `location()` (translocated / read-only / outside Applications registers nothing), the channel marker (claim + attention), heal (`meeting-capture heal --json` and, if Claude Code's entries are off, `contorch-memory claude install`) only while meeting-capture says nothing is being recorded, and whether to offer setup.
+- **Updates**: `install_allowed()` is true only when `meeting-capture status --json` says `recording: false` (recording or can't-tell holds the install); `prepare_update()` stops with `reason=update`, which the new version resumes. (Sparkle itself is M4.)
+- **`contorch stop|resume [--json] [--reason user|quit|update]`** (`contorch.stack/1`): the recorder through meeting-capture's own `stop --json --reason` / `start --json` (either backend; `start` re-enables a job a legacy stop disabled); `launchctl` only for retired agents (an old chroma server, transcript-watcher) and meeting-capture 0.7. `~/.contorch/stopped.json` records the reason.
+- `contorch lifecycle launch|quit|install-allowed --json` exposes the same decisions to the app's future SwiftUI shell.
+
 ## See also
 
 - [`stirredo/context-orchestrator`](https://github.com/contorch/context-orchestrator) — task + context store, MCP server, auto-context hook

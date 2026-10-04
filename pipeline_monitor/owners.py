@@ -145,6 +145,34 @@ def locate(name: str) -> str | None:
     return None
 
 
+def locate_in(ch: str, name: str, layout: dict | None = None) -> str | None:
+    """`name` as installed by channel `ch` — adopt and rollback run one
+    channel's copy explicitly (the old channel's `meeting-capture stop`, the
+    target's `contorch-memory`). `layout` is a marker's (bundle_root,
+    brew_prefix). This install's own channel is plain locate()."""
+    layout = layout or {}
+    if ch == channel():
+        return locate(name)
+    if ch == "app":
+        root = layout.get("bundle_root")
+        return _exe(Path(root) / "Contents" / "Resources" / "bin" / name) if root else None
+    if ch == "brew":
+        formula = FORMULA.get(name)
+        prefixes = [layout.get("brew_prefix")] if layout.get("brew_prefix") else list(BREW_PREFIXES)
+        for p in prefixes:
+            found = _exe(Path(p) / "opt" / (formula or name) / "bin" / name) if formula else None
+            if found:
+                return found
+        return None
+    # dev: a source checkout's own venv, or its per-user venv
+    formula = FORMULA.get(name)
+    for c in (_which(name), USER_VENVS[formula] / "bin" / name if formula in USER_VENVS else None):
+        found = _exe(c)
+        if found and not is_brew_wrapper(found) and bundle_root(found) is None:
+            return found
+    return None
+
+
 def is_brew_wrapper(path: str) -> bool:
     """A Homebrew bin/ or opt/ wrapper (its venv is rebuilt on upgrade)."""
     try:

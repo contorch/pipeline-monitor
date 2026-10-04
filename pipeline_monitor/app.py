@@ -64,6 +64,12 @@ def _prune_menu_refs(menu) -> None:
     _walk(menu)
 
 
+def _log(msg: str) -> None:
+    """One line to stderr (Contorch.app: ~/Library/Logs/Contorch/menubar.log)."""
+    import sys
+    print(msg, file=sys.stderr, flush=True)
+
+
 def _notify(app: str, title: str, body: str) -> None:
     """Best-effort notification: UNUserNotificationCenter inside Contorch.app,
     osascript elsewhere (rumps.notification silently no-ops without a signed
@@ -200,14 +206,17 @@ def _permission_lines(snap: st.Snapshot) -> list[rumps.MenuItem]:
     return out
 
 
-def _module_rows(snap: st.Snapshot) -> list[rumps.MenuItem]:
+def _module_rows(snap: st.Snapshot, on_setup=None) -> list[rumps.MenuItem]:
     """Modules that aren't on: a greyed title, then the one way to add it
     (brew: the install line, copied; app: turn it on). From
-    modules.menu_lines — the same rows the SwiftUI shell will draw."""
+    modules.menu_lines — the same rows the SwiftUI shell will draw.
+    "Set up Contorch…" opens setup in Terminal inside the app (on_setup),
+    and copies `contorch setup` elsewhere."""
     out = []
     for line in modules.menu_lines(snap.modules) if snap.modules.get("modules") else []:
         if line["id"] == "setup":
-            out.append(rumps.MenuItem("Set up Contorch…", callback=_copy_command_callback("contorch setup")))
+            out.append(rumps.MenuItem("Set up Contorch…",
+                                      callback=on_setup or _copy_command_callback("contorch setup")))
             continue
         out.append(rumps.MenuItem(line["text"], callback=(
             _copy_command_callback(line["action"]["command"]) if line.get("enabled") and line.get("action")
@@ -522,6 +531,85 @@ def _open_dir_callback(path: Path):
     return _cb
 
 
+# ============================================================ Contorch.app glue
+#
+# Presentation only: what each item does is decided by its Python owner —
+# lifecycle (location, move, quit), updates (Sparkle), loginitem
+# (SMAppService.mainApp), setup_launcher (setup in Terminal), and the
+# `contorch uninstall|rollback` verbs.
+
+ISSUES_URL = "https://github.com/contorch/contorch-macos/issues/new"
+LOGS_DIR = Path.home() / "Library" / "Logs" / "Contorch"
+
+
+def in_app() -> bool:
+    return owners.channel() == "app" and owners.bundle_root() is not None
+
+
+def app_version() -> str | None:
+    """'0.4.0 (12)' from the running app's Info.plist (the menu bar process
+    sees the app as its main bundle), else None."""
+    try:
+        from Foundation import NSBundle
+        b = NSBundle.mainBundle()
+        short = b.objectForInfoDictionaryKey_("CFBundleShortVersionString")
+        build = b.objectForInfoDictionaryKey_("CFBundleVersion")
+    except Exception:
+        return None
+    if not short:
+        return None
+    return f"{short} ({build})" if build else str(short)
+
+
+def report_url() -> str:
+    """A new contorch-macos issue with the versions filled in — no logs (Copy
+    diagnostics is the redacted way to add them)."""
+    import platform
+    from urllib.parse import urlencode
+    from . import __version__
+    lines = [
+        "**What happened?**", "", "", "**What did you expect?**", "", "",
+        "---",
+        f"Contorch.app: {app_version() or 'not the app'}",
+        f"pipeline-monitor: {__version__} · channel: {owners.channel()}",
+        f"macOS {platform.mac_ver()[0]} ({platform.machine()})",
+        "Diagnostics: menu › Diagnostics › Copy diagnostics, then paste here (redacted: no keys, no transcript text)",
+    ]
+    return ISSUES_URL + "?" + urlencode({"body": "\n".join(lines)})
+
+
+def has_verb(module: str) -> bool:
+    """Whether this pipeline-monitor ships `contorch <module>` (adopt/rollback,
+    uninstall): menu items for verbs it doesn't have aren't shown."""
+    import importlib.util
+    return importlib.util.find_spec(f"pipeline_monitor.{module}") is not None
+
+
+def _alert(title: str, message: str, buttons: list[str], checkbox: str | None = None) -> tuple[int, bool]:
+    """A modal NSAlert in front of everything (a menu bar app has no window):
+    -> (index of the button pressed, whether the checkbox is ticked)."""
+    from AppKit import NSAlert, NSApplication, NSButton, NSMakeRect
+    NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+    a = NSAlert.alloc().init()
+    a.setMessageText_(title)
+    a.setInformativeText_(message)
+    for b in buttons:
+        a.addButtonWithTitle_(b)
+    box = None
+    if checkbox:
+        box = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 340, 22))
+        box.setButtonType_(3)              # NSButtonTypeSwitch
+        box.setTitle_(checkbox)
+        box.setState_(0)                   # unticked by default
+        a.setAccessoryView_(box)
+    rc = int(a.runModal())
+    return rc - 1000, bool(box is not None and box.state())   # NSAlertFirstButtonReturn = 1000
+
+
+def _on_main(fn, *args) -> None:
+    AppHelper.callAfter(fn, *args)
+
+
 # ============================================================ menu delegate
 
 class _MenuOpenDelegate(NSObject):
@@ -594,17 +682,32 @@ class PipelineMonitor(rumps.App):
         except Exception:
             pass
 
+        # Contorch.app: Sparkle (only from /Applications), the setup
+        # launcher's .command (rewritten so it points at this copy).
+        self._updates = None
+        self._busy: str | None = None             # "Uninstalling…" etc. while a verb runs
+        if in_app():
+            AppHelper.callAfter(self._start_updates)
+            try:
+                from . import setup_launcher
+                setup_launcher.write()
+            except Exception as e:  # noqa: BLE001
+                _log(f"[setup] couldn't write the setup launcher: {e!r}")
+
         # Launch policy is Python's (lifecycle.on_launch): resume a stack a
         # quit or an update stopped, in every channel. Off the main thread:
         # starting the recorder can take a few seconds.
         def _launch():
             from . import lifecycle
+            res: dict = {}
             try:
                 res = lifecycle.on_launch()
-                print(f"[lifecycle] on_launch: {res}", file=__import__("sys").stderr, flush=True)
+                _log(f"[lifecycle] on_launch: {res}")
             except Exception as e:  # noqa: BLE001 — never keep the menu from starting
-                print(f"[lifecycle] on_launch failed: {e!r}", file=__import__("sys").stderr, flush=True)
+                _log(f"[lifecycle] on_launch failed: {e!r}")
             AppHelper.callAfter(self._refresh_callback, None)
+            if res.get("needs_setup") and res.get("location") == "ok":
+                AppHelper.callAfter(self._offer_setup)
         threading.Thread(target=_launch, name="on-launch", daemon=True).start()
 
     # ----- callbacks -----
@@ -722,6 +825,230 @@ class PipelineMonitor(rumps.App):
     def _on_quit(self, _):
         rumps.quit_application()
 
+    # ----- Contorch.app: updates, login item, setup, move, uninstall, diagnostics -----
+
+    def _start_updates(self):
+        from . import updates
+        self._updates = updates.Updates(on_change=lambda: self._refresh_callback(None), log=_log)
+        res = self._updates.start()
+        _log(f"[updates] {res}")
+
+    def _offer_setup(self):
+        """§5.1 step 5: offered once per launch; the menu row stays until setup
+        has written the channel marker."""
+        if getattr(self, "_setup_offered", False):
+            return
+        self._setup_offered = True
+        i, _ = _alert("Set up Contorch?",
+                      "Setup runs in Terminal: it asks what this Mac should do (record meetings, or memory only), "
+                      "then connects Claude Code. You can run it again any time from the menu.",
+                      ["Set Up…", "Later"])
+        if i == 0:
+            self._on_setup(None)
+
+    def _on_setup(self, _):
+        if not in_app():
+            _copy_command_callback("contorch setup")(None)
+            return
+        from . import setup_launcher
+        res = setup_launcher.launch()
+        if not res["ok"]:
+            _notify("Contorch", "Couldn't open setup in Terminal",
+                    f"{res.get('error')} — or run: \"{setup_launcher.contorch_bin()}\" setup")
+
+    def _on_move(self, _):
+        from . import lifecycle
+        res = lifecycle.move_to_applications()
+        if not res["ok"]:
+            _alert("Couldn't move Contorch to Applications", res["error"]["message"], ["OK"])
+            return
+        subprocess.Popen(["open", "-n", res["dest"]])
+        self._quit_handover()
+
+    def _quit_handover(self):
+        _QUIT_REASON["value"] = "handover"
+        rumps.quit_application()
+
+    def _on_login_item(self, _):
+        from . import loginitem
+        st = loginitem.status(force=True)
+        if st == "requires_approval":
+            loginitem.open_settings()      # the user turned it off there; only they can turn it back on
+            return
+        res = loginitem.set_on(st != "enabled")
+        if not res["ok"]:
+            _notify("Contorch", "Open at Login didn't change", (res.get("error") or {}).get("message") or res["status"])
+        self._refresh_callback(None)
+
+    def _on_check_updates(self, _):
+        if self._updates is not None:
+            self._updates.check()
+
+    def _on_install_now(self, _):
+        i, _x = _alert("Install the update now?",
+                       "Contorch can't tell whether a meeting is being recorded. Installing now stops the recorder; "
+                       "it starts again when the new version opens.", ["Install Now", "Wait"])
+        if i == 0 and self._updates is not None:
+            self._updates.install_now()
+
+    def _on_copy_diagnostics(self, _):
+        """`contorch doctor --json --bundle`: versions, the owners' JSON and
+        log tails, redacted (no keys, no transcript text)."""
+        def _run():
+            import json as _json
+            from . import diagnostics
+            try:
+                doc = diagnostics.bundle()
+                ok = copy_to_clipboard(_json.dumps(doc, indent=2, default=str))
+                _notify("Contorch", "Diagnostics copied" if ok else "Couldn't copy diagnostics",
+                        "Redacted: no keys, no transcript text. Paste it into your report.")
+            except Exception as e:  # noqa: BLE001
+                _notify("Contorch", "Couldn't collect diagnostics", str(e)[:200])
+        threading.Thread(target=_run, name="diagnostics", daemon=True).start()
+
+    def _on_open_logs(self, _):
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(["open", str(LOGS_DIR)])
+
+    def _on_report(self, _):
+        webbrowser.open(report_url())
+
+    def _run_verb(self, busy: str, argv: list[str], schema: str, done) -> None:
+        """Run a `contorch` verb (JSON Lines → result) off the main thread."""
+        self._busy = busy
+        self._refresh_callback(None)
+
+        def _run():
+            res = owners.call("contorch", *argv, schema=schema, timeout=1800)
+            AppHelper.callAfter(self._verb_done, res, done)
+        threading.Thread(target=_run, name=f"contorch-{argv[0]}", daemon=True).start()
+
+    def _verb_done(self, res: dict, done) -> None:
+        self._busy = None
+        d = res.get("data") or {}
+        if res["status"] == "ok" and d.get("ok"):
+            done(d)
+            return
+        err = d.get("error") if isinstance(d.get("error"), dict) else {"message": res.get("error")}
+        _alert("Contorch couldn't finish", f"{err.get('message') or err.get('code') or 'unknown error'}\n\n"
+               "Nothing more was changed. Choose it again to resume.", ["OK"])
+        self._refresh_callback(None)
+
+    def _on_uninstall(self, _):
+        i, remove = _alert(
+            "Uninstall Contorch?",
+            "This stops the recorder, removes Contorch from Claude Code (MCP server, hook, skills) and from "
+            "Login Items, and resets its privacy permissions. Your meetings and memory are kept unless you tick "
+            "the box. Afterwards, drag Contorch to the Trash.",
+            ["Uninstall", "Cancel"], checkbox="Also delete my meetings and memory")
+        if i != 0:
+            return
+        argv = ["uninstall", "--yes", "--json"] + (["--remove-data"] if remove else [])
+
+        def _done(d):
+            from . import loginitem
+            loginitem.unregister()
+            root = owners.bundle_root()
+            if root is not None:
+                subprocess.Popen(["open", "-R", str(root)])       # show it, ready for the Trash
+            todo = [t.get("message") or t.get("code") for t in d.get("todo") or []]
+            if todo:
+                _alert("Contorch is uninstalled", "Still to do:\n• " + "\n• ".join(todo), ["OK"])
+            self._quit_handover()
+        self._run_verb("Uninstalling Contorch…", argv, "contorch.uninstall", _done)
+
+    def _on_rollback(self, _):
+        i, _x = _alert("Go back to Homebrew?",
+                       "Contorch goes back to the Homebrew install this app took over: the recorder, Claude Code's "
+                       "entries and the menu bar are handed back to it. Your meetings and memory stay.",
+                       ["Go Back to Homebrew", "Cancel"])
+        if i != 0:
+            return
+
+        def _done(d):
+            from . import loginitem
+            loginitem.unregister()
+            self._quit_handover()
+        self._run_verb("Going back to Homebrew…", ["rollback", "--yes", "--json"], "contorch.rollback", _done)
+
+    def on_reopen(self) -> None:
+        """Opened again from Finder or Spotlight while running (§5.1 Reopen):
+        the way back when the menu bar icon is hidden (notch, menu bar
+        settings)."""
+        snap = self._snap
+        head = _build_status_line(snap).title if snap else "Contorch is running"
+        buttons, actions = ["OK"], [None]
+        if in_app():
+            buttons.append("Set Up…")
+            actions.append(self._on_setup)
+            if has_verb("uninstall"):
+                buttons.append("Uninstall…")
+                actions.append(self._on_uninstall)
+        buttons.append("Quit")
+        actions.append(self._on_quit)
+        i, _x = _alert("Contorch is running", f"{head}\n\nIts menu is the Contorch icon in the menu bar.", buttons)
+        if 0 <= i < len(actions) and actions[i] is not None:
+            actions[i](None)
+
+    # ----- the Contorch.app part of the menu -----
+
+    def _app_top_rows(self) -> list[rumps.MenuItem]:
+        """Rows under the headline: where the app runs from, update state."""
+        from . import lifecycle
+        out = []
+        if not in_app():
+            return out
+        if self._busy:
+            out.append(rumps.MenuItem(self._busy))
+        loc = lifecycle.location()
+        if loc not in ("ok", "not_in_app"):
+            why = {"translocated": "Contorch is running from the download",
+                   "read_only": "Contorch is running from the disk image",
+                   "outside_applications": "Contorch isn't in Applications"}.get(loc, loc)
+            out.append(rumps.MenuItem(f"⚠ {why} — it can't start at login or update"))
+            out.append(rumps.MenuItem("Move Contorch to Applications…", callback=self._on_move))
+        u = self._updates.menu_state() if self._updates is not None else {}
+        if u.get("waiting"):
+            v = u.get("installing_version") or ""
+            if u.get("reason") == "recording":
+                out.append(rumps.MenuItem(f"Update {v} waits until the meeting is over"))
+            elif u.get("reason") == "recording_unknown":
+                out.append(rumps.MenuItem("Update waiting: can't tell whether a meeting is being recorded"))
+                if u.get("override_offered"):
+                    out.append(rumps.MenuItem("Install now (stops recording)…", callback=self._on_install_now))
+            else:
+                out.append(rumps.MenuItem(f"Installing update {v}…"))
+        elif u.get("pending_version"):
+            out.append(rumps.MenuItem(f"Update Available ({u['pending_version']})…", callback=self._on_check_updates))
+        return out
+
+    def _app_bottom_rows(self) -> list[rumps.MenuItem]:
+        """Open at Login, Check for Updates…, Diagnostics, Uninstall."""
+        out = []
+        if in_app():
+            from . import loginitem
+            st = loginitem.status()
+            if st != "unavailable":
+                title = "Open at Login" + (" (off in System Settings — click to open it)"
+                                           if st == "requires_approval" else "")
+                item = rumps.MenuItem(title, callback=None if self._busy else self._on_login_item)
+                item.state = 1 if st == "enabled" else 0
+                out.append(item)
+            if self._updates is not None and self._updates.started:
+                out.append(rumps.MenuItem("Check for Updates…",
+                                          callback=self._on_check_updates if self._updates.can_check() else None))
+        diag = rumps.MenuItem("Diagnostics")
+        diag.add(rumps.MenuItem("Copy diagnostics", callback=self._on_copy_diagnostics))
+        diag.add(rumps.MenuItem("Open logs folder", callback=self._on_open_logs))
+        diag.add(rumps.MenuItem("Report a problem…", callback=self._on_report))
+        if in_app() and has_verb("adopt") and (chan.read() or {}).get("adopted_from"):
+            diag.add(rumps.separator)
+            diag.add(rumps.MenuItem("Go back to Homebrew…", callback=None if self._busy else self._on_rollback))
+        out.append(diag)
+        if in_app() and has_verb("uninstall"):
+            out.append(rumps.MenuItem("Uninstall Contorch…", callback=None if self._busy else self._on_uninstall))
+        return out
+
     # ----- pulse animation (recording state only) -----
 
     def _start_pulse(self):
@@ -793,7 +1120,8 @@ class PipelineMonitor(rumps.App):
             tline = _build_transcription_line(snap)
             if tline is not None:
                 self.menu.add(tline)
-        for line in _attention_lines(snap) + _module_rows(snap):
+        for line in (_attention_lines(snap) + _module_rows(snap, self._on_setup if in_app() else None)
+                     + self._app_top_rows()):
             self.menu.add(line)
         self.menu.add(rumps.separator)
 
@@ -829,6 +1157,9 @@ class PipelineMonitor(rumps.App):
         keep = self._build_keep_recording(snap)
         if keep is not None:
             self.menu.add(keep)
+        self.menu.add(rumps.separator)
+        for row in self._app_bottom_rows():
+            self.menu.add(row)
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Quit", callback=self._on_quit))
 
@@ -988,10 +1319,34 @@ def install_sigterm() -> None:
                                                                              True)
 
 
+_REOPEN: dict = {}
+
+
+def install_reopen(app: "PipelineMonitor") -> None:
+    """applicationShouldHandleReopen:hasVisibleWindows: on rumps' application
+    delegate: opening Contorch again from Finder or Spotlight shows
+    app.on_reopen(). Added to rumps' delegate class before run() sets the
+    delegate (rumps has no hook for it)."""
+    _REOPEN["app"] = app
+
+    def _reopen(self, nsapp, has_visible_windows):
+        target = _REOPEN.get("app")
+        if target is not None:
+            AppHelper.callAfter(target.on_reopen)
+        return False
+
+    import objc
+    sel = objc.selector(_reopen, selector=b"applicationShouldHandleReopen:hasVisibleWindows:", signature=b"Z@:@Z")
+    if not rumps.rumps.NSApp.instancesRespondToSelector_(b"applicationShouldHandleReopen:hasVisibleWindows:"):
+        objc.classAddMethods(rumps.rumps.NSApp, [sel])
+
+
 def main():
     rumps.events.before_quit.register(_before_quit)
     install_sigterm()
-    PipelineMonitor().run()
+    app = PipelineMonitor()
+    install_reopen(app)
+    app.run()
 
 
 if __name__ == "__main__":

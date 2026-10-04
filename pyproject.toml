@@ -8,8 +8,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Inside Contorch.app: notifications through UNUserNotificationCenter.
-app = ["pyobjc-framework-UserNotifications; sys_platform == 'darwin'"]
+# Inside Contorch.app: notifications through UNUserNotificationCenter, and
+# Open at Login through SMAppService.mainApp (loginitem.py). Sparkle needs no
+# extra: updates.py loads the app's own Sparkle.framework with pyobjc-core.
+app = [
+    "pyobjc-framework-UserNotifications; sys_platform == 'darwin'",
+    "pyobjc-framework-ServiceManagement; sys_platform == 'darwin'",
+]
 dev = ["pytest"]
 
 [project.scripts]

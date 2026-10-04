@@ -216,3 +216,71 @@ def test_before_quit_asks_lifecycle(monkeypatch):
     monkeypatch.setitem(app._QUIT_REASON, "value", "user")
     app._before_quit()
     assert seen == ["user"]
+
+
+# ------------------------------------------------------------ handover, Move to Applications
+
+def test_handover_quit_stops_nothing(rec, monkeypatch):
+    monkeypatch.setenv("CONTORCH_CHANNEL", "app")
+    out = lifecycle.on_quit("handover")
+    assert out["action"].startswith("none (handed over") and rec.verbs() == []
+    assert ct.stopped_reason() is None
+
+
+def _fake_app(root):
+    (root / "Contents" / "MacOS").mkdir(parents=True)
+    (root / "Contents" / "Info.plist").write_text("<plist/>")
+    (root / "Contents" / "MacOS" / "Contorch").write_text("#!/bin/sh\n")
+    return root
+
+
+def test_move_to_applications_copies_and_drops_quarantine(tmp_path, monkeypatch):
+    src = _fake_app(tmp_path / "Volumes" / "Contorch" / "Contorch.app")
+    subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;00000000;Safari;", str(src / "Contents" / "Info.plist")],
+                   check=True)
+    monkeypatch.setattr(owners, "bundle_root", lambda executable=None: src)
+    dest_dir = tmp_path / "Applications"
+    res = lifecycle.move_to_applications(dest_dir)
+    assert res == {"ok": True, "dest": str(dest_dir / "Contorch.app"), "replaced": False}
+    copied = dest_dir / "Contorch.app" / "Contents" / "Info.plist"
+    assert copied.read_text() == "<plist/>"
+    assert "com.apple.quarantine" not in subprocess.run(["xattr", str(copied)], capture_output=True, text=True).stdout
+    assert (src / "Contents" / "Info.plist").exists()             # the original stays (a DMG is read-only anyway)
+
+
+def test_move_to_applications_trashes_an_older_copy(tmp_path, monkeypatch):
+    src = _fake_app(tmp_path / "Downloads" / "Contorch.app")
+    old = _fake_app(tmp_path / "Applications" / "Contorch.app")
+    (old / "Contents" / "old-marker").write_text("x")
+    trashed = []
+
+    def fake_trash(p):
+        trashed.append(p)
+        import shutil
+        shutil.rmtree(p)
+        return True
+    monkeypatch.setattr(lifecycle, "_trash", fake_trash)
+    monkeypatch.setattr(owners, "bundle_root", lambda executable=None: src)
+    res = lifecycle.move_to_applications(tmp_path / "Applications")
+    assert res["ok"] and res["replaced"] and trashed == [old]
+    assert not (old / "Contents" / "old-marker").exists()
+
+
+def test_move_to_applications_refuses_when_the_old_copy_stays(tmp_path, monkeypatch):
+    src = _fake_app(tmp_path / "Downloads" / "Contorch.app")
+    _fake_app(tmp_path / "Applications" / "Contorch.app")
+    monkeypatch.setattr(lifecycle, "_trash", lambda p: False)
+    monkeypatch.setattr(owners, "bundle_root", lambda executable=None: src)
+    res = lifecycle.move_to_applications(tmp_path / "Applications")
+    assert not res["ok"] and res["error"]["code"] == "exists"
+
+
+def test_move_to_applications_when_already_there_is_a_noop(tmp_path, monkeypatch):
+    app = _fake_app(tmp_path / "Applications" / "Contorch.app")
+    monkeypatch.setattr(owners, "bundle_root", lambda executable=None: app)
+    assert lifecycle.move_to_applications(tmp_path / "Applications")["noop"] is True
+
+
+def test_move_outside_the_app(monkeypatch):
+    monkeypatch.setattr(owners, "bundle_root", lambda executable=None: None)
+    assert lifecycle.move_to_applications()["error"]["code"] == "not_in_app"

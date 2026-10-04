@@ -22,6 +22,8 @@ from typing import Any, Optional
 
 import httpx
 
+from . import transcription as stt
+
 HOME = Path.home()
 CO_DIR = HOME / ".context-orchestrator"
 CO_DB = CO_DIR / "context.db"
@@ -259,6 +261,24 @@ def capture_mode_status() -> dict[str, Any]:
         out["error"] = str(e)
     return out
 
+
+# ----------------------------------------------------------- transcription engine
+
+def transcription_status(wait: bool = False) -> dict[str, Any]:
+    """How meeting-capture transcribes: on this Mac (with its language),
+    Gemini, or unavailable (and why), plus whether live mode streams calls and
+    where audio goes. Asked from meeting-capture (`meeting-capture stt
+    --json`; pipeline_monitor.transcription), never re-derived here. The
+    answer is cached and refreshed on a background thread unless wait=True,
+    so the 5-second timer never waits on it. {"ok": False} without the
+    recorder's launchd agent (the menu leaves the line out)."""
+    try:
+        if not stt.PLIST.exists():
+            return {"ok": False, "installed": False,
+                    "error": "meeting-capture launchd agent not installed"}
+        return stt.current(wait=wait)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 def launchd_status() -> dict[str, Any]:
@@ -603,6 +623,7 @@ class Snapshot:
     hook: dict[str, Any] = field(default_factory=dict)
     disk: dict[str, Any] = field(default_factory=dict)
     embeddings: dict[str, Any] = field(default_factory=dict)
+    transcription: dict[str, Any] = field(default_factory=dict)
 
     def overall(self) -> str:
         """State for the menu bar icon: rec / rec_stale / perm / err / ok.
@@ -611,6 +632,8 @@ class Snapshot:
           - chroma daemon unreachable
           - any installed launchd daemon stopped
           - MCP server has a recent tool-call failure (not just idle)
+          - nothing can transcribe (meeting-capture's `stt --json` says not
+            ready): meetings are recorded but stay untranscribed
         We deliberately do NOT flag MCP as 'err' just because it hasn't
         seen a tool call recently — Claude Code might just not be open.
         """
@@ -634,6 +657,8 @@ class Snapshot:
         for label, info in self.launchd.get("daemons", {}).items():
             if info.get("installed") and not info.get("running"):
                 problems.append(label.split(".")[-1])
+        if self.transcription.get("ok") and self.transcription.get("attention"):
+            problems.append("transcription")
         # Only flag MCP if its MOST RECENT call failed (active problem),
         # not if it's been idle.
         last_call = self.mcp.get("last_call")
@@ -650,8 +675,9 @@ class Snapshot:
         return "err" if problems else "ok"
 
 
-def collect() -> Snapshot:
-    """Run every collector and return a snapshot. Each call is sub-second."""
+def collect(wait: bool = False) -> Snapshot:
+    """Run every collector and return a snapshot. Each call is sub-second
+    (meeting-capture is asked in the background unless wait=True)."""
     return Snapshot(
         chroma=chroma_status(),
         db=db_status(),
@@ -663,12 +689,13 @@ def collect() -> Snapshot:
         hook=hook_status(),
         disk=disk_status(),
         embeddings=embeddings_status(),
+        transcription=transcription_status(wait=wait),
     )
 
 
 if __name__ == "__main__":
     import json as _j
-    snap = collect()
+    snap = collect(wait=True)
     print(_j.dumps({
         "overall": snap.overall(),
         "chroma": snap.chroma,
@@ -680,4 +707,5 @@ if __name__ == "__main__":
         "recording": snap.recording,
         "hook": snap.hook,
         "disk": snap.disk,
+        "transcription": snap.transcription,
     }, indent=2, default=str))

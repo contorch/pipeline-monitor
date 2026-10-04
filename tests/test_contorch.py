@@ -156,3 +156,89 @@ def test_recent_sessions_each_have_copy_and_open(monkeypatch):
     menu = app._build_recent_submenu(snap)
     (item,) = list(menu.values())
     assert [i.title for i in item.values()] == ["Copy transcript", "Open in TextEdit"]
+
+
+# ------------------------------------------------------------ menu bar: transcription
+
+def _view(**over):
+    from conftest import mc_json
+    from pipeline_monitor import transcription as stt
+    return stt.view({"status": "ok", "mc": "/x/mc", "data": mc_json(**over), "error": None})
+
+
+def test_menu_transcription_line():
+    import pipeline_monitor.app as app
+    from conftest import DUTCH, LIVE_ON, NEEDS_MODEL
+    from pipeline_monitor import transcription as stt
+
+    def title(t):
+        return app._build_transcription_line(app.st.Snapshot(transcription=t)).title
+    assert title(_view()) == "Transcription: on this Mac (en-US)"
+    assert title(_view(**DUTCH)) == "Transcription: Gemini"
+    assert title(_view(**LIVE_ON)) == "Transcription: on this Mac (en-US) · live: calls stream to Gemini"
+    assert title(_view(**NEEDS_MODEL)).startswith("⚠ Transcription: unavailable — on this Mac isn't available")
+    assert title(stt.view({"status": "checking", "mc": "/x/mc"})) == "Transcription: checking…"
+    assert title(stt.view({"status": "old", "mc": "/x/mc"})) == \
+        "Transcription: Gemini (meeting-capture < 0.7 — upgrade for on-device)"
+    assert title(stt.view({"status": "error", "mc": "/x/mc", "error": "boom"})) == "Transcription: unknown — boom"
+    long = stt.view({"status": "error", "mc": "/x/mc", "error": "failed (exit 1): " + "x" * 200})
+    assert len(title(long)) == 90 and title(long).endswith("…")      # stderr never widens the menu
+
+
+def test_menu_transcription_line_hidden_without_meeting_capture():
+    import pipeline_monitor.app as app
+    from pipeline_monitor import transcription as stt
+    snap = app.st.Snapshot(transcription={"ok": False, "error": "meeting-capture launchd agent not installed"})
+    assert app._build_transcription_line(snap) is None
+    snap = app.st.Snapshot(transcription=stt.view({"status": "missing", "error": "not installed"}))
+    assert app._build_transcription_line(snap) is None
+
+
+def test_menu_details_come_from_meeting_captures_answer():
+    import pipeline_monitor.app as app
+    from conftest import NEEDS_MODEL
+    snap = app.st.Snapshot(transcription=_view(gemini_key=True, gemini_fallback=True))
+    lines = app._transcription_details(snap)
+    assert lines[0] == "Transcription: on this Mac (en-US)"
+    assert "setting: auto · locale en-US" in lines[1]
+    assert lines[2].strip() == "on-device: ready" and "Gemini key: yes" in lines[3]
+    # auto + a key: Gemini takes over when on-device fails — never "never leaves"
+    assert lines[-2].strip() == ("audio: on this Mac — but if on-device transcription stops working, "
+                                 "Gemini takes over (uploaded)")
+    assert lines[-1].strip() == "`meeting-capture stt apple` never uploads"
+    assert not any("never leaves" in l for l in lines)
+    lines = app._transcription_details(app.st.Snapshot(transcription=_view(choice="apple",
+                                                                           on_device_only_hint=None)))
+    assert lines[-1].strip() == "audio: meeting audio never leaves this Mac"
+    titles = [i.title for i in app._build_details_submenu(snap).values() if hasattr(i, "title")]
+    assert "Transcription: on this Mac (en-US)" in titles
+    lines = app._transcription_details(app.st.Snapshot(transcription=_view(**NEEDS_MODEL)))
+    assert "set it up: meeting-capture language en-US" in [l.strip() for l in lines]
+
+
+def test_menu_says_live_mode_streams(fake_mc):
+    """Menu bar Transcription line and Details, from meeting-capture's answer
+    (live mode + stt auto + a key file streams every call to Gemini)."""
+    import pipeline_monitor.app as app
+    from conftest import LIVE_ON, mc_json, write_plist
+    from pipeline_monitor import transcription as stt
+    write_plist(stt.PLIST, {})
+    fake_mc.set(json=mc_json(**LIVE_ON))
+    snap = app.st.Snapshot(transcription=app.st.transcription_status(wait=True))
+    assert app._build_transcription_line(snap).title == \
+        "Transcription: on this Mac (en-US) · live: calls stream to Gemini"
+    lines = [l.strip() for l in app._transcription_details(snap)]
+    assert "live mode: on — every call streams to Gemini (uploaded)" in lines
+    assert lines[-1] == "audio: every call streams to Google Gemini as it happens (live mode)"
+    fake_mc.set(json=mc_json(live={"requested": True, "active": False,
+                                   "blocker": "live mode streams to Gemini and no Google API key is set"}))
+    stt.clear_cache()
+    snap = app.st.Snapshot(transcription=app.st.transcription_status(wait=True))
+    assert app._build_transcription_line(snap).title == "Transcription: on this Mac (en-US)"
+    assert any(l.strip().startswith("live mode: runs batch — live mode streams")
+               for l in app._transcription_details(snap))
+
+
+def test_menu_actions_find_meeting_capture_like_the_transcription_line(fake_mc):
+    import pipeline_monitor.app as app
+    assert app._meeting_capture_bin() == str(fake_mc.path)

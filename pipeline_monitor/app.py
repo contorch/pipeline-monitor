@@ -12,7 +12,6 @@ submenu at the bottom. Auto-refreshes every REFRESH_INTERVAL_S seconds.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import threading
 import time
@@ -27,6 +26,7 @@ from PyObjCTools import AppHelper  # noqa: F401  (ensures AppKit init order)
 
 from . import contorch as ct
 from . import status as st
+from . import transcription as stt
 from .smoketest import run_smoke_test
 
 REFRESH_INTERVAL_S = 5
@@ -183,17 +183,51 @@ def _build_status_line(snap: st.Snapshot) -> rumps.MenuItem:
     return rumps.MenuItem(f"○ Idle{mode}")
 
 
+def _build_transcription_line(snap: st.Snapshot) -> rumps.MenuItem | None:
+    """'Transcription: on this Mac (en-US)' / 'Gemini' / '⚠ … unavailable — why',
+    with ' · live: calls stream to Gemini' while live mode uploads every call,
+    as meeting-capture reports it (`meeting-capture stt --json`). None when
+    the recorder isn't installed (the status line says so)."""
+    t = snap.transcription or {}
+    if not t.get("ok"):
+        return None
+    text = _truncate(f"Transcription: {t.get('label') or '?'}", 90)   # an error label carries stderr
+    return rumps.MenuItem(f"⚠ {text}" if t.get("attention") else text)
+
+
+def _transcription_details(snap: st.Snapshot) -> list[str]:
+    """Details-submenu lines: the setting, on-device state, key, live mode and
+    where audio goes, all from meeting-capture's own answer."""
+    t = snap.transcription or {}
+    if not t.get("ok"):
+        return [f"Transcription: {_truncate(t['error'], 60)}"] if t.get("error") else []
+    lines = [f"Transcription: {_truncate(t.get('label') or '?', 70)}"]
+    d = t.get("data")
+    if d:
+        lines.append(f"  setting: {d.get('choice')} · locale {d.get('locale')}")
+        a = d.get("apple") or {}
+        lines.append(f"  on-device: {'ready' if a.get('usable') else _truncate(a.get('reason') or '?', 60)}")
+        if d.get("needs_model") and d.get("install_hint"):
+            lines.append(f"  set it up: {d['install_hint']}")
+        lines.append(f"  Gemini key: {'yes' if d.get('gemini_key') else 'none'}")
+        live = d.get("live") or {}
+        if live.get("active"):
+            lines.append("  live mode: on — every call streams to Gemini (uploaded)")
+        elif live.get("requested"):
+            lines.append(f"  live mode: runs batch — {_truncate(live.get('blocker') or '?', 60)}")
+    if t.get("privacy"):
+        lines.append(f"  audio: {_truncate(t['privacy'], 100)}")
+    if t.get("privacy_fix"):
+        lines.append(f"  {_truncate(t['privacy_fix'], 70)}")
+    if t.get("note"):
+        lines.append(f"  ! {_truncate(t['note'], 100)}")
+    return lines
+
+
 def _meeting_capture_bin() -> str | None:
-    """The meeting-capture CLI. launchd does not give this app a shell PATH,
-    so fall back to the brew wrapper and then the daemon's own venv."""
-    for candidate in (
-        shutil.which("meeting-capture"),
-        "/opt/homebrew/bin/meeting-capture",
-        str(Path.home() / ".meeting-capture" / "venv" / "bin" / "meeting-capture"),
-    ):
-        if candidate and Path(candidate).is_file():
-            return candidate
-    return None
+    """The meeting-capture CLI (brew's opt/ path first: launchd gives this
+    app no shell PATH). The same lookup the transcription line uses."""
+    return stt.find_meeting_capture()
 
 
 def _build_index_line(snap: st.Snapshot) -> rumps.MenuItem:
@@ -332,6 +366,8 @@ def _build_details_submenu(snap: st.Snapshot) -> rumps.MenuItem:
         submenu.add(rumps.MenuItem(
             "Embeddings: off (keyword search only)" if e.get("off")
             else f"Embeddings: {e.get('mode')} (setting: {e.get('configured')})"))
+    for line in _transcription_details(snap):
+        submenu.add(rumps.MenuItem(line))
 
     # SQLite breakdown
     d = snap.db
@@ -652,6 +688,9 @@ class PipelineMonitor(rumps.App):
         self.menu.clear()
 
         self.menu.add(_build_status_line(snap))
+        tline = _build_transcription_line(snap)
+        if tline is not None:
+            self.menu.add(tline)
         self.menu.add(rumps.separator)
 
         self.menu.add(_build_index_line(snap))

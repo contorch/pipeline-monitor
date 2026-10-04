@@ -1,28 +1,64 @@
-"""Shared fixtures. Every test is isolated from this Mac's real meeting-capture
-(its CLI, agent plist and helper), Gemini key and settings: transcription is
-asked from a fake `meeting-capture` executable that prints canned
-`stt --json` answers (FakeMeetingCapture)."""
+"""Shared fixtures. Every test is isolated from this Mac's real install:
+HOME is a scratch directory (so ~/.contorch, ~/.meeting-capture, ~/.claude
+are never the real ones), owners.locate() finds nothing but what a test puts
+in its scratch Homebrew prefix, and no Contorch channel variables leak in.
+Transcription is asked from a fake `meeting-capture` executable that prints
+canned `stt --json` answers (FakeMeetingCapture)."""
 from __future__ import annotations
 
 import json
 import os
 import plistlib
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from pipeline_monitor import mcconfig, owners
 from pipeline_monitor import transcription as stt
 
 
+# Never run these for real from a test: they change this Mac's launchd jobs,
+# Homebrew, Claude Code or privacy settings. Tests replace the helper that
+# would call them (contorch._launchctl, a fake runner) or put a fake on PATH
+# inside their scratch directory.
+FORBIDDEN = {"launchctl", "brew", "tccutil", "claude", "osascript", "open", "pbcopy"}
+_RealPopen = subprocess.Popen
+
+
+class _GuardedPopen(_RealPopen):
+    def __init__(self, args, *a, **kw):
+        argv0 = args if isinstance(args, str) else (args[0] if args else "")
+        name = os.path.basename(str(argv0).split(" ")[0])
+        if name in FORBIDDEN and not str(argv0).startswith(os.environ.get("PM_TEST_TMP", "\0")):
+            raise AssertionError(f"a test tried to run the real {name}: {args!r}")
+        super().__init__(args, *a, **kw)
+
+
 @pytest.fixture(autouse=True)
-def _isolate_transcription(tmp_path, monkeypatch):
+def _no_real_system_commands(tmp_path, monkeypatch):
+    monkeypatch.setenv("PM_TEST_TMP", str(tmp_path))
+    monkeypatch.setattr(subprocess, "Popen", _GuardedPopen)
+
+
+@pytest.fixture(autouse=True)
+def _isolate(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    for v in ("CONTORCH_CHANNEL", "CONTORCH_OP", "HOMEBREW_PREFIX"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setattr(owners, "BREW_PREFIXES", (str(tmp_path / "brew"),))
+    monkeypatch.setattr(owners, "_which", lambda name: None)
+    monkeypatch.setattr(owners, "SELF_BIN", tmp_path / "self-bin")
+    monkeypatch.setattr(owners, "USER_VENVS", {k: tmp_path / "venvs" / k for k in owners.USER_VENVS})
+    monkeypatch.setattr(mcconfig, "LEGACY_PLIST", tmp_path / "no-agent.plist")
+    mcconfig.clear_cache()
     monkeypatch.setattr(stt, "PLIST", tmp_path / "no-agent.plist")
     monkeypatch.setattr(stt, "KEY_FILE", tmp_path / "no-key")
-    monkeypatch.setattr(stt, "MC_CANDIDATES", ())
     monkeypatch.setattr(stt, "MC_VENV", tmp_path / "no-venv" / "meeting-capture")
     monkeypatch.setattr(stt, "MC_STAMP", tmp_path / "no-venv" / ".formula-version")
-    monkeypatch.setattr(stt, "_which", lambda name: None)
     # Setup reads keys from this shell, so none of the developer's may leak in.
     for v in [k for k in os.environ if k.startswith("MEETING_CAPTURE_")] + [
             "GOOGLE_API_KEY", "GEMINI_API_KEY", "CONTORCH_NONINTERACTIVE"]:
@@ -30,6 +66,19 @@ def _isolate_transcription(tmp_path, monkeypatch):
     stt.clear_cache()
     yield
     stt.clear_cache()
+    mcconfig.clear_cache()
+
+
+def on_brew(tmp_path: Path, name: str, target: Path) -> Path:
+    """Put `target` where owners.locate() finds `name` first: the scratch
+    Homebrew prefix's opt/<formula>/bin (a symlink, so the target's own
+    directory stays its working directory)."""
+    link = tmp_path / "brew" / "opt" / owners.FORMULA.get(name, name) / "bin" / name
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(target)
+    return link
 
 
 def write_plist(path: Path, env: dict) -> Path:
@@ -162,12 +211,12 @@ class FakeMeetingCapture:
 
 @pytest.fixture
 def fake_mc(tmp_path, monkeypatch):
-    """A fake meeting-capture found where brew puts it, answering mc_json()."""
-    root = tmp_path / "mc-bin"
-    root.mkdir()
+    """A fake meeting-capture found where brew puts it (the scratch prefix's
+    opt/meeting-capture/bin), answering mc_json()."""
+    root = tmp_path / "brew" / "opt" / "meeting-capture" / "bin"
+    root.mkdir(parents=True)
     mc = FakeMeetingCapture(root)
     mc.path.write_text(FAKE_MC.replace("{python}", sys.executable))
     mc.path.chmod(0o755)
     mc.set(json=mc_json())
-    monkeypatch.setattr(stt, "MC_CANDIDATES", (str(mc.path),))
     return mc

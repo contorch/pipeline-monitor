@@ -15,9 +15,10 @@ assuming en-US after meeting-capture's language started following the Mac, and
 promised "audio never leaves this Mac" on a Dutch Mac where meeting-capture
 picks Gemini.
 
-  * find_meeting_capture(): the Homebrew opt/ path (Apple silicon, then
-    Intel), then PATH, then the per-user venv of a source install. That is
-    what setup runs commands with (`meeting-capture stt apple`, …).
+  * find_meeting_capture(): pipeline_monitor.owners.locate — the app's
+    bundle in Contorch.app; otherwise the Homebrew opt/ path (Apple silicon,
+    then Intel), then PATH, then the per-user venv of a source install. That
+    is what setup runs commands with (`meeting-capture stt apple`, …).
   * find_reader(): what a read runs. Homebrew's meeting-capture is a bash
     wrapper that, after an install or a `brew upgrade`, deletes and rebuilds
     ~/.meeting-capture/venv with pip — the venv the launchd recorder runs
@@ -62,7 +63,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import signal
 import subprocess
 import threading
@@ -74,12 +74,6 @@ HOME = Path.home()
 PLIST = HOME / "Library" / "LaunchAgents" / "com.contorch.meeting-capture.plist"
 KEY_FILE = HOME / ".config" / "google" / "key"
 
-# Where `brew install contorch/tap/contorch` puts the CLI: the stable opt/
-# path. launchd gives the menu bar no shell PATH.
-MC_CANDIDATES = (
-    "/opt/homebrew/opt/meeting-capture/bin/meeting-capture",
-    "/usr/local/opt/meeting-capture/bin/meeting-capture",
-)
 # meeting-capture's per-user venv (the brew wrapper's MEETING_CAPTURE_VENV
 # default): what the recorder runs, and what reads run.
 VENV = Path(os.environ.get("MEETING_CAPTURE_VENV") or HOME / ".meeting-capture" / "venv")
@@ -105,16 +99,10 @@ NOT_BUILT = ("meeting-capture isn't set up yet (no ~/.meeting-capture/venv) — 
 
 # ------------------------------------------------------------------ locate + read
 
-def _which(name: str) -> str | None:
-    return shutil.which(name)
-
-
 def find_meeting_capture() -> str | None:
-    """The meeting-capture CLI: brew's opt/ path, then PATH, then the venv."""
-    for c in (*MC_CANDIDATES, _which("meeting-capture"), str(MC_VENV)):
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
-            return c
-    return None
+    """The meeting-capture CLI (owners.locate: pm's one binary locator)."""
+    from .owners import locate
+    return locate("meeting-capture")
 
 
 _STAMP_CHECK = re.compile(rb'\$\(cat "\$STAMP"[^)]*\)" != "([^"]+)"')

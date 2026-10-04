@@ -377,6 +377,7 @@ def stack(tmp_path, monkeypatch, env, fake_mc):
     bins = {"meeting-capture": str(fake_mc.path), **{n: f"/x/{n}" for n in (
         "context-orchestrator-chroma", "transcript-watcher", "contorch-mcp", "claude")}}
     monkeypatch.setattr(ct.shutil, "which", lambda n: bins.get(n))     # no brew
+    monkeypatch.setattr(ct.owners, "locate", lambda n: bins.get(n))
     monkeypatch.setattr(ct, "CLAUDE_JSON", tmp_path / "claude.json")
     monkeypatch.setattr(ct, "CLAUDE_MD", tmp_path / "CLAUDE.md")
     monkeypatch.setattr(ct, "STATE_DIR", tmp_path / "state")

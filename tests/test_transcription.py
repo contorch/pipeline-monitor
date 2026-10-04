@@ -23,19 +23,30 @@ def _exe(path, executable=True):
     return str(path)
 
 
-def test_find_meeting_capture_order(tmp_path, monkeypatch):
-    arm, intel = _exe(tmp_path / "arm" / "meeting-capture"), _exe(tmp_path / "intel" / "meeting-capture")
-    on_path, venv = _exe(tmp_path / "path" / "meeting-capture"), _exe(tmp_path / "venv" / "meeting-capture")
+def test_find_meeting_capture_is_owners_locate(tmp_path, monkeypatch):
+    """One binary locator in pm (owners.locate): brew's opt/ path (Apple
+    silicon, then Intel), then PATH, then a dev venv, then the per-user venv;
+    a non-executable candidate is skipped."""
+    from pipeline_monitor import owners
+    arm, intel = tmp_path / "arm", tmp_path / "intel"
+    arm_mc = _exe(arm / "opt" / "meeting-capture" / "bin" / "meeting-capture")
+    intel_mc = _exe(intel / "opt" / "meeting-capture" / "bin" / "meeting-capture")
+    on_path = _exe(tmp_path / "path" / "meeting-capture")
+    venv = _exe(tmp_path / "venvs" / "meeting-capture" / "bin" / "meeting-capture")
+    monkeypatch.setattr(owners, "BREW_PREFIXES", (str(tmp_path / "none"),))
+    monkeypatch.setattr(owners, "USER_VENVS", {"meeting-capture": tmp_path / "none-venv"})
     assert stt.find_meeting_capture() is None
-    monkeypatch.setattr(stt, "MC_VENV", venv)
+    monkeypatch.setattr(owners, "USER_VENVS", {"meeting-capture": tmp_path / "venvs" / "meeting-capture"})
     assert stt.find_meeting_capture() == venv
-    monkeypatch.setattr(stt, "_which", lambda name: on_path if name == "meeting-capture" else None)
+    monkeypatch.setattr(owners, "_which", lambda name: on_path if name == "meeting-capture" else None)
     assert stt.find_meeting_capture() == on_path
-    monkeypatch.setattr(stt, "MC_CANDIDATES", (str(tmp_path / "gone"), intel))
-    assert stt.find_meeting_capture() == intel
-    monkeypatch.setattr(stt, "MC_CANDIDATES", (arm, intel))
-    assert stt.find_meeting_capture() == arm
-    monkeypatch.setattr(stt, "MC_CANDIDATES", (_exe(tmp_path / "noexec" / "meeting-capture", False),))
+    monkeypatch.setattr(owners, "BREW_PREFIXES", (str(tmp_path / "gone"), str(intel)))
+    assert stt.find_meeting_capture() == intel_mc
+    monkeypatch.setattr(owners, "BREW_PREFIXES", (str(arm), str(intel)))
+    assert stt.find_meeting_capture() == arm_mc
+    noexec = tmp_path / "noexec"
+    _exe(noexec / "opt" / "meeting-capture" / "bin" / "meeting-capture", False)
+    monkeypatch.setattr(owners, "BREW_PREFIXES", (str(noexec),))
     assert stt.find_meeting_capture() == on_path                 # not executable: skipped
 
 
@@ -284,7 +295,7 @@ def brew(tmp_path, monkeypatch, fake_mc):
     wrapper.write_text(WRAPPER.format(marker=marker, version="0.7.0", sysaudio=opt / "sysaudio",
                                       venv_mc=venv / "bin" / "meeting-capture"))
     wrapper.chmod(0o755)
-    monkeypatch.setattr(stt, "MC_CANDIDATES", (str(wrapper),))
+    monkeypatch.setattr(stt, "find_meeting_capture", lambda: str(wrapper))
     monkeypatch.setattr(stt, "MC_VENV", venv / "bin" / "meeting-capture")
     monkeypatch.setattr(stt, "MC_STAMP", stamp)
     monkeypatch.delenv("MEETING_CAPTURE_SYSAUDIO", raising=False)

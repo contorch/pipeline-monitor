@@ -31,7 +31,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-from . import owners
+from . import channel as chan
+from . import mcconfig, modules, owners
 from . import transcription as stt
 
 LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
@@ -212,10 +213,7 @@ def resume(log=print) -> bool:
 # ------------------------------------------------------------------ setup
 
 KEY_FILE = Path.home() / ".config" / "google" / "key"
-CHROMA_DIR = Path.home() / ".context-orchestrator" / "chroma"
-CLAUDE_MD = Path.home() / ".claude" / "CLAUDE.md"
-CLAUDE_JSON = Path.home() / ".claude.json"
-MCP_NAME = "context-orchestrator"   # tool names in CLAUDE.md guidance depend on it
+MCP_NAME = "context-orchestrator"   # the MCP server's name in Claude Code (context-orchestrator's)
 AI_STUDIO = "https://aistudio.google.com/apikey"
 TCC_PANE = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
 
@@ -323,51 +321,6 @@ def _plist_env(label: str) -> dict:
         return {}
 
 
-def _plist_program(label: str) -> str:
-    import plistlib
-    try:
-        return plistlib.loads((LAUNCH_AGENTS / f"{label}.plist").read_bytes())["ProgramArguments"][0]
-    except Exception:
-        return ""
-
-
-def _existing_mcp_env() -> dict:
-    """CO_* settings from an existing registration (the key itself is NOT carried —
-    it belongs in the key file, not in ~/.claude.json)."""
-    try:
-        srv = json.loads(CLAUDE_JSON.read_text()).get("mcpServers", {}).get(MCP_NAME) or {}
-    except Exception:
-        return {}
-    return {k: v for k, v in (srv.get("env") or {}).items() if k.startswith("CO_")}
-
-
-def _existing_mcp_entry() -> dict | None:
-    try:
-        return json.loads(CLAUDE_JSON.read_text()).get("mcpServers", {}).get(MCP_NAME)
-    except Exception:
-        return None
-
-
-def mcp_add_cmd(claude: str, env: dict, server: str) -> list[str]:
-    """`claude mcp add` argv. The server name must come BEFORE the -e options:
-    -e is variadic in the Claude CLI and swallows everything up to `--`,
-    including a name placed after it ("missing required argument")."""
-    cmd = [claude, "mcp", "add", "--scope", "user", MCP_NAME]
-    for k, v in env.items():
-        cmd += ["-e", f"{k}={v}"]
-    return cmd + ["--", server]
-
-
-def _claude_md_template() -> Path | None:
-    brew = shutil.which("brew")
-    if brew:
-        res = _run([brew, "--prefix", "context-orchestrator"])
-        cand = Path(res.stdout.strip()) / "share" / "context-orchestrator" / "claude-md-template.md"
-        if res.returncode == 0 and cand.is_file():
-            return cand
-    return None
-
-
 EMBEDDING_CHOICES = (
     ("gemini", "Gemini — best at paraphrased questions; needs the key, sends text to Google"),
     ("local", "Local model — offline, no key; ~80 MB download; weaker on paraphrases"),
@@ -428,19 +381,69 @@ def _ask_for_key(log) -> bool:
     return True
 
 
+def _check_key(mc: str, log, todo: list) -> str:
+    """Ask meeting-capture whether Google accepts the key the recorder will
+    use (`meeting-capture stt --json --check-key`: one tiny read-only call).
+    -> accepted | rejected | missing | unreachable | unknown (an older
+    meeting-capture can't check)."""
+    res = owners.call("meeting-capture", "stt", "--json", "--check-key", exe=mc, timeout=60)
+    if res["status"] != "ok" or not isinstance((res["data"] or {}).get("key_check"), dict):
+        return "unknown"
+    kc = res["data"]["key_check"]
+    verdict = kc.get("key") or "unknown"
+    if verdict == "accepted":
+        log("  ✓ Google accepted the Gemini key")
+    elif verdict == "rejected":
+        log(f"  ✗ Google rejected the Gemini key{': ' + kc['message'] if kc.get('message') else ''}")
+        todo.append(f"The Gemini key was rejected — put a valid one in {KEY_FILE} "
+                    "(https://aistudio.google.com/apikey), then run contorch setup again")
+    elif verdict == "unreachable":
+        log("  · couldn't reach Google to check the key (offline?); it will be tried when a meeting needs it")
+    return verdict
+
+
 LIVE_KEEP_LOCAL = "(`meeting-capture mode batch` or `meeting-capture stt apple` keeps audio on this Mac)."
 APPLY_TIMEOUT_S = 45 * 60      # a first download of a language's model can take a while
 
 
-def _need_key(log, todo: list) -> bool:
-    """Gemini is the only way to transcribe here: make sure the recorder will
-    find a key (the key file), asking for one on a terminal."""
-    if _recorder_key(log) or (_interactive() and _key_out_of_reach() is None and _ask_for_key(log)):
+# What setup learned about the Gemini key this run (`stt --json --check-key`).
+KEY_VERDICT: dict = {"key": None}
+
+
+def _key_ok(log, todo: list, mc: str | None) -> bool:
+    """A key the recorder can use, which Google doesn't reject."""
+    if mc is None:
         return True
+    KEY_VERDICT["key"] = _check_key(mc, log, todo)
+    return KEY_VERDICT["key"] != "rejected"
+
+
+def _need_key(log, todo: list, mc: str | None = None) -> bool:
+    """Gemini is the only way to transcribe here: make sure the recorder will
+    find a key (the key file), asking for one on a terminal, and that Google
+    accepts it (meeting-capture checks it)."""
+    if _recorder_key(log) or (_interactive() and _key_out_of_reach() is None and _ask_for_key(log)):
+        return _key_ok(log, todo, mc)
     if not _interactive():
         log("  ✗ no key the recorder can use, and no terminal to ask on — meeting transcription stays off")
     todo.append(f"Add a Gemini key: {_key_todo()}, then run `contorch setup` again")
     return False
+
+
+def _on_device_line(d: dict) -> tuple[str, bool]:
+    """meeting-capture's `on_device_line` / `on_device_for_mac_language`
+    (≥ 0.8), shown as it is. meeting-capture 0.7 has neither: a neutral
+    sentence that claims nothing, covering the Mac's language only when the
+    language wasn't a guess."""
+    if isinstance(d.get("on_device_line"), str) and isinstance(d.get("on_device_for_mac_language"), bool):
+        return d["on_device_line"], d["on_device_for_mac_language"]
+    a = d.get("apple") or {}
+    if not (a.get("usable") or a.get("installable")):
+        return f"On-device transcription isn't available on this Mac: {a.get('reason') or 'unavailable'}", False
+    if d.get("locale_guessed"):
+        return (f"On-device transcription here covers {d.get('locale')}, not this Mac's language "
+                f"({d.get('mac_language') or 'unknown'})."), False
+    return f"On-device transcription can run on this Mac ({d.get('locale')}).", True
 
 
 def _choose_transcription(log, todo: list, mc: str) -> list[str] | None:
@@ -458,7 +461,7 @@ def _choose_transcription(log, todo: list, mc: str) -> list[str] | None:
     if t["status"] == "old":
         log(f"  This meeting-capture transcribes with Google Gemini only ({stt.OLD_LABEL}).")
         log("  That needs a Gemini API key; meeting audio is uploaded to Google for it.")
-        _need_key(log, todo)
+        _need_key(log, todo, mc)
         return None
     if t["status"] != "ok":
         log(f"  ! couldn't ask meeting-capture how it transcribes: {t['error']}")
@@ -466,9 +469,10 @@ def _choose_transcription(log, todo: list, mc: str) -> list[str] | None:
         return None
     d = t["data"]
     a = d.get("apple") or {}
+    line, for_mac = _on_device_line(d)
     if not (a.get("usable") or a.get("installable")):
         reason = a.get("reason") or "unavailable"
-        log(f"  · On-device transcription isn't available here: {reason}")
+        log(f"  · {line}")
         if d.get("choice") == "apple":
             log("    It is set to on-device only, so recordings wait on this Mac until it works.")
             todo.append(f"Transcription is waiting for on-device speech ({reason}). "
@@ -476,13 +480,15 @@ def _choose_transcription(log, todo: list, mc: str) -> list[str] | None:
             return None
         log("  Transcription then needs Gemini (a Gemini API key); meeting audio is uploaded")
         log("  to Google for it. Transcripts and the search index stay on this Mac.")
-        _need_key(log, todo)
+        _need_key(log, todo, mc)
         return None
 
     loc = d.get("locale") or "?"
-    log(f"  ✓ This Mac can transcribe meetings itself (Apple on-device speech, {loc}) — no API key needed.")
-    if d.get("locale_guessed"):
-        log(f"    ({d['locale_why']}. Gemini detects the language itself.)")
+    # meeting-capture's own sentence: it never says "this Mac can transcribe"
+    # when on-device can't do the Mac's language (then auto keeps Gemini).
+    log(f"  {'✓' if for_mac else '·'} {line}")
+    if not for_mac:
+        log("    Gemini detects the language itself.")
     if d["live"]["active"]:
         log("    But live mode is on, and it streams every call to Google Gemini whichever")
         log("    engine you pick here.")
@@ -510,13 +516,17 @@ def _choose_transcription(log, todo: list, mc: str) -> list[str] | None:
                        ("gemini", "Gemini — meeting audio is uploaded to Google")]
         else:
             options = [(only, f"On this Mac ({loc})"), ("gemini", "Gemini — needs a free API key")]
+        if not for_mac:
+            # On-device can't do this Mac's own language: Gemini is offered first.
+            options = [o for o in options if o[0] == "gemini"] + [o for o in options if o[0] != "gemini"]
         default = next((str(i) for i, (w, _) in enumerate(options, 1) if w == want), "1")
         for i, (_, text) in enumerate(options, 1):
             log(f"    {i}. {text}{'  (default)' if str(i) == default else ''}")
         ans = input(f"  Choose 1-{len(options)} (Enter for default): ").strip() or default
         want = dict((str(i), w) for i, (w, _) in enumerate(options, 1)).get(ans, options[int(default) - 1][0])
     if want == "gemini":
-        if _recorder_key(log) or (_interactive() and _key_out_of_reach() is None and _ask_for_key(log)):
+        if (_recorder_key(log) or (_interactive() and _key_out_of_reach() is None and _ask_for_key(log))) \
+                and _key_ok(log, todo, mc):
             # Already Gemini, and staying so (not just until a missing on-device
             # model arrives): leave the setting alone. Otherwise pick it.
             keep = d["engine"] == "gemini" and d["ready"] and not d.get("needs_model")
@@ -611,125 +621,281 @@ def _report_transcription(mc: str, log, todo: list, done: list) -> None:
 
 
 def _cli_setup(sub) -> None:
-    sub.add_parser("setup", help="configure everything after installing (safe to re-run)").set_defaults(
-        func=lambda args: 0 if setup() else 1)
+    p = sub.add_parser("setup", help="set up (or repair) Contorch on this Mac — safe to re-run; an interrupted "
+                                     "run resumes")
+    p.add_argument("--record", choices=("yes", "no"),
+                   help="record meetings on this Mac (default: ask; without a terminal: keep what is set up)")
+    p.add_argument("--linein", choices=("yes", "no"), help="record from a USB audio interface")
+    p.add_argument("--cli", choices=("yes", "no"), help="Contorch.app: put the commands on your PATH")
+    p.add_argument("--embeddings", choices=("local", "gemini", "none", "imported"),
+                   help="how search understands questions (imported: vectors come from another Mac)")
+    p.set_defaults(func=lambda args: 0 if setup(record=args.record, linein=args.linein, cli=args.cli,
+                                                 embeddings=args.embeddings) else 1)
 
 
-def setup(log=print) -> bool:
-    """Everything scriptable, in order, then an honest list of what is left."""
-    todo: list[str] = []
-    done: list[str] = []
+RECORDING_NOTE = ("  When another app uses your microphone (a call), Contorch records that meeting's audio,\n"
+                  "  turns it into a transcript, and keeps both on this Mac for Claude Code to search.")
+MEMORY_ONLY_EMBEDDINGS = (
+    ("local", "Local model — offline after one ~80 MB download; no key"),
+    ("gemini", "Gemini — needs a key on this Mac; sends text to Google"),
+    ("imported", "Imported from your recording Mac — use that Mac's model (usually Gemini); without a key "
+                 "here, search is keyword-only"),
+)
 
-    def step(title: str) -> None:
-        log(f"\n▶ {title}")
 
-    # 0. What is installed?
-    step("Checking components")
-    bins = {n: owners.locate(n) for n in ("meeting-capture", "context-orchestrator-chroma",
-                                          "transcript-watcher", "contorch-mcp")}
-    missing = [n for n, p in bins.items() if not p]
-    if missing:
-        log(f"  ✗ not on PATH: {', '.join(missing)}")
-        log("    Install everything with: brew install contorch/tap/contorch")
-        return False
-    for n, p in bins.items():
-        log(f"  ✓ {n}")
-    claude = shutil.which("claude")
-    log("  ✓ Claude Code" if claude else "  ! Claude Code not found — meetings will be captured but not connected to Claude")
+def _yes(prompt: str, default: bool) -> bool:
+    ans = input(f"{prompt} [{'Y/n' if default else 'y/N'}] ").strip().lower()
+    return default if not ans else ans in ("y", "yes")
 
-    log("\n  contorch records meeting audio when another app uses your microphone")
-    log("  and turns it into searchable transcripts.")
 
-    # 1. Transcription: on this Mac when it can (no key), else Gemini (key).
-    #    Applied and reported once the recorder is installed (step 5).
-    step("Transcription")
-    stt_cmd = _choose_transcription(log, todo, bins["meeting-capture"])
+def _choose_modules(log, me: str, mc: str | None, record: str | None, linein: str | None,
+                    cli: str | None) -> dict[str, bool]:
+    """Step 0: which modules this Mac wants. Defaults: what is chosen or set
+    up already (modules.json, or what the owners report), else the
+    channel's defaults. Without a terminal and without flags: keep it."""
+    current = modules.wanted() or modules.infer_wanted(modules.observe(me))
+    want = dict(current) if current else {m: modules.MODULES[m].default.get(me, False) for m in modules.ORDER}
+    want["memory"] = True
+    if me == "brew":
+        want["cli"] = True
+    if mc is None:
+        if want.get("recorder"):
+            log("  · the meeting recorder isn't installed here "
+                f"({modules.MODULES['recorder'].brew_add}) — memory only")
+        want["recorder"] = want["linein"] = False
+    elif record is not None:
+        want["recorder"] = record == "yes"
+    elif _interactive():
+        log(RECORDING_NOTE)
+        want["recorder"] = _yes("  Record meetings on this Mac?", bool(want.get("recorder", True)))
+    if not want["recorder"]:
+        want["linein"] = False
+    elif linein is not None:
+        want["linein"] = linein == "yes"
+    elif _interactive() and current is None:
+        want["linein"] = _yes("  Do you record from a USB audio interface (line-in)?", bool(want.get("linein")))
+    if me == "app":
+        if cli is not None:
+            want["cli"] = cli == "yes"
+        elif _interactive():
+            want["cli"] = _yes("  Put the contorch commands on your PATH (~/.local/bin)?", bool(want.get("cli")))
+    log("  ✓ " + ", ".join(modules.MODULES[m].title.lower() for m in modules.ORDER if want.get(m))
+        + ("" if want["recorder"] else " — this Mac doesn't record (memory only)"))
+    return want
 
-    # 1b. How search understands questions (context-orchestrator >= 0.4).
-    step("Search embeddings")
-    _setup_embeddings(log, todo, done)
 
-    # 2. Move an older source install over, with a backup of the index.
-    old = [a for a in agents()
-           if "/.context-orchestrator/venv/" not in _plist_program(a["label"])
-           and "/.meeting-capture/venv/" not in _plist_program(a["label"])]
-    if old:
-        step("Moving your existing daemons onto this install")
-        for a in old:
-            log(f"  · {a['desc']}: {_plist_program(a['label'])}")
-        stop(log=lambda m: log("  " + m.strip()))
-        backup = CHROMA_DIR.parent / "chroma.backup-before-contorch-setup"
-        if CHROMA_DIR.is_dir() and not backup.exists():
-            shutil.copytree(CHROMA_DIR, backup)
-            log(f"  ✓ backed up the search index to {backup}")
+def _memory_only_embeddings(log, todo: list, done: list, choice: str | None) -> None:
+    """A Mac that doesn't record: where search's vectors come from (§4.2.1),
+    stored in modules.json and applied by context-orchestrator."""
+    if choice is None and _interactive():
+        default = "gemini" if _have_key() else "local"
+        for i, (name, desc) in enumerate(MEMORY_ONLY_EMBEDDINGS, 1):
+            log(f"    {i}. {desc}{'  (default)' if name == default else ''}")
+        ans = input("  Choose 1-3 (Enter for default): ").strip()
+        choice = {"1": "local", "2": "gemini", "3": "imported"}.get(ans, default)
+    if choice is None:
+        _setup_embeddings(log, todo, done)
+        return
+    if choice in modules.EMBEDDINGS_SOURCES:
+        modules.set_embeddings_source(choice)
+    _setup_embeddings(log, todo, done, choice="gemini" if choice == "imported" else choice)
+    if choice == "imported" and not _have_key():
+        log("    Without a Gemini key on this Mac, search uses keywords (the imported vectors need the "
+            "same model to search).")
 
-    # 3. Search index + indexer
-    step("Search index")
-    res = _run([bins["context-orchestrator-chroma"], "install"], timeout=900)
-    if res.returncode != 0:
-        log("  ✗ chroma install failed:\n" + (res.stderr or res.stdout)[-800:])
-        return False
-    _launchctl("enable", f"gui/{_uid()}/com.contorch.context-orchestrator-chroma")
-    if _chroma_up(90):
-        log("  ✓ chroma running")
+
+def _selftest(log, todo: list) -> None:
+    """context-orchestrator tests the memory end to end. A blocked download
+    (offline, a proxy) is a to-do, not a setup failure: keyword search works."""
+    res = owners.call("contorch-memory", "selftest", "--json", schema="contorch-memory.selftest/", timeout=600)
+    if res["status"] != "ok":
+        if res["status"] != "old":
+            log(f"  ! couldn't run the memory self-test: {res['error']}")
+        return
+    d = res["data"]
+    if d.get("ok"):
+        log(f"  ✓ memory works end to end ({d.get('ms')} ms)")
+        return
+    code = (d.get("error") or {}).get("code")
+    if code in ("offline", "proxy", "tls"):
+        log(f"  · the search model couldn't be downloaded ({code})")
+        todo.append("Search will use keywords until the model downloads (check the network or proxy, then "
+                    "`contorch smoke`)")
     else:
-        log("  ✗ chroma did not answer within 90s — see ~/.context-orchestrator/chroma-daemon.log")
+        log(f"  ✗ memory self-test failed at {d.get('stage')}: {(d.get('error') or {}).get('message')}")
+        todo.append("The memory self-test failed: contorch smoke (then contorch setup again)")
+
+
+def _search_index(log, todo: list, done: list) -> bool:
+    """Daemon-free memory: context-orchestrator moves a chroma-server install
+    to the in-process index itself (`index migrate --in-process`), after a
+    verified backup of context.db and the index into ~/.contorch/backups.
+    Nothing to do on an install that is already in-process."""
+    bdir = STATE_DIR / "backups" / time.strftime("setup-%Y%m%d-%H%M%S")
+    res = owners.call("contorch-memory", "index", "migrate", "--in-process", "--backup-dir", str(bdir), "--json",
+                      schema="contorch-memory.backup/", timeout=1800)
+    if res["status"] == "old":
+        log("  ! this context-orchestrator predates the in-process index — brew upgrade context-orchestrator")
+        todo.append("Upgrade context-orchestrator (≥ 0.5), then run contorch setup again")
+        return True
+    if res["status"] != "ok":
+        log(f"  ✗ {res['error']}")
+        todo.append("Move the search index in-process: contorch-memory index migrate --in-process")
         return False
-    # No indexer daemon: the MCP server indexes new transcripts on demand
-    # (context-orchestrator 0.3+). Retire an agent from an older install.
+    d = res["data"]
+    if not d.get("ok"):
+        err = d.get("error") or {}
+        log(f"  ✗ {err.get('code')}: {err.get('message')} — nothing was changed")
+        todo.append(f"Move the search index in-process ({err.get('code')}): contorch-memory index migrate "
+                    "--in-process")
+        return False
+    if d.get("performed"):
+        log(f"  ✓ backed up your memory to {bdir} and retired the chroma server (the index is in-process now)")
+    else:
+        log("  ✓ in-process (no background server)")
+    for row in _retired_agents():
+        log(f"  ✓ removed the old {row} daemon (indexing is on demand now)")
+    done.append("Search index (in-process)")
+    return True
+
+
+def _retired_agents() -> list[str]:
+    """Remove a transcript-watcher an older install left (context-orchestrator
+    0.3+ indexes on demand). Legacy cleanup is the only launchctl setup uses."""
+    out = []
     for org in ORGS:
         plist = LAUNCH_AGENTS / f"com.{org}.transcript-watcher.plist"
         if plist.is_file():
             _launchctl("bootout", f"gui/{_uid()}/com.{org}.transcript-watcher")
             plist.unlink()
-            log("  ✓ removed the old transcript-watcher daemon (indexing is on demand now)")
-    done.append("search index")
+            out.append("transcript-watcher")
+    return out
 
-    # 4. Claude Code
-    step("Claude Code connection")
-    if claude:
-        env = _existing_mcp_env()
-        previous = _existing_mcp_entry()
-        _run([claude, "mcp", "remove", "--scope", "user", MCP_NAME])
-        res = _run(mcp_add_cmd(claude, env, bins["contorch-mcp"]))
-        if res.returncode == 0:
-            log(f"  ✓ registered `{MCP_NAME}` → {bins['contorch-mcp']}"
-                + (f" (kept {', '.join(env)})" if env else ""))
-            done.append("Claude Code registration")
-        else:
-            log("  ✗ claude mcp add failed: " + (res.stderr or res.stdout).strip()[-300:])
-            if previous:
-                # Never leave Claude with no server: put the old entry back.
-                _run([claude, "mcp", "add-json", "--scope", "user", MCP_NAME, json.dumps(previous)])
-                log("    restored your previous registration")
-            todo.append("Register the MCP server: claude mcp add --scope user "
-                        f"{MCP_NAME} -- {bins['contorch-mcp']}")
-        tpl = _claude_md_template()
-        # Skip if CLAUDE.md already covers it — the template's marker, or the
-        # user's own hand-written guidance (don't give them two copies).
-        existing = CLAUDE_MD.read_text().lower() if CLAUDE_MD.is_file() else ""
-        if tpl and "context-orchestrator" not in existing and "context orchestrator" not in existing:
-            CLAUDE_MD.parent.mkdir(parents=True, exist_ok=True)
-            with CLAUDE_MD.open("a") as f:
-                f.write("\n" + tpl.read_text())
-            log(f"  ✓ added usage guidance to {CLAUDE_MD}")
+
+def _claude_code(log, todo: list, done: list, me: str, recorder: bool) -> None:
+    """Claude Code is context-orchestrator's to connect (`contorch-memory
+    claude install`: MCP server, hook, CLAUDE.md block, transcripts skill)
+    and meeting-capture's /meeting skill its own. pm only reads their
+    answers."""
+    res = owners.call("contorch-memory", "claude", "install", "--channel", me, "--json",
+                      schema="contorch-memory.claude/", timeout=300)
+    if res["status"] == "old":
+        log("  ! this context-orchestrator can't connect Claude Code itself — brew upgrade context-orchestrator")
+        todo.append("Upgrade context-orchestrator (≥ 0.5), then run contorch setup again to connect Claude Code")
+    elif res["status"] != "ok":
+        log(f"  ✗ {res['error']}")
+        todo.append(f"Connect Claude Code: contorch-memory claude install --channel {me}")
     else:
-        todo.append("Install Claude Code, then run `contorch setup` again to connect it")
+        d = res["data"]
+        for part, title in (("mcp", "MCP server"), ("hook", "auto-context hook"), ("claude_md", "CLAUDE.md guidance"),
+                            ("skill", "transcripts skill")):
+            row = d.get(part) or {}
+            log(f"  {'✓' if row.get('matches') else '·'} {title}"
+                + ("" if row.get("matches") else " — not set up"))
+        if (d.get("hook") or {}).get("legacy_copy") == "kept_custom":
+            log("    (your own ~/.claude/hooks/auto-context.py was kept beside it)")
+        if d.get("blocked_by_managed_settings"):
+            log("  ! Claude Code's managed settings block part of this: " + "; ".join(d.get("managed_reasons") or []))
+        for item in d.get("todo") or []:
+            todo.append(str(item))
+        if d.get("ok"):
+            done.append("Claude Code connection")
+        elif d.get("error"):
+            log(f"  ✗ {d['error'].get('message')}")
+            todo.append(f"Connect Claude Code: contorch-memory claude install --channel {me}")
+    if recorder:
+        sk = owners.call("meeting-capture", "skill", "install", "--json", schema="meeting-capture.skill/", timeout=60)
+        if sk["status"] == "ok" and sk["data"].get("ok"):
+            action = sk["data"].get("action")
+            log("  ✓ /meeting skill" + (" (your own copy kept)" if action == "kept_user_copy" else ""))
 
-    # 5. Meeting capture
-    step("Meeting capture")
-    res = _run([bins["meeting-capture"], "install"])
-    if res.returncode != 0:
-        log("  ✗ meeting-capture install failed:\n" + (res.stderr or res.stdout)[-800:])
+
+def _agent(mc: str, verb: str, log, *extra: str) -> bool | None:
+    """meeting-capture's agent verbs (`install|restart --json`); None when
+    this meeting-capture predates them (0.7: plain `install`)."""
+    res = owners.call("meeting-capture", verb, *extra, "--json", schema="meeting-capture.agent/", exe=mc,
+                      timeout=300)
+    if res["status"] == "old":
+        return None
+    if res["status"] != "ok":
+        log(f"  ✗ meeting-capture {verb}: {res['error']}")
         return False
-    _launchctl("enable", f"gui/{_uid()}/com.contorch.meeting-capture")
-    sysaudio = _plist_env("com.contorch.meeting-capture").get("MEETING_CAPTURE_SYSAUDIO", "")
-    log("  ✓ capture daemon running")
-    _apply_stt(stt_cmd, log, todo)
-    _report_transcription(bins["meeting-capture"], log, todo, done)
+    d = res["data"]
+    if not d.get("ok"):
+        log(f"  ✗ meeting-capture {verb}: {(d.get('error') or {}).get('message')}")
+        return False
+    return True
 
-    # 6. The one permission macOS will not let us grant
-    step("Allow system-audio recording (macOS requires you to do this)")
+
+def _install_recorder(mc: str, log) -> bool:
+    ok = _agent(mc, "install", log)
+    if ok is None:                                  # meeting-capture 0.7
+        res = _run([mc, "install"])
+        if res.returncode != 0:
+            log("  ✗ meeting-capture install failed:\n" + (res.stderr or res.stdout)[-800:])
+            return False
+        _launchctl("enable", f"gui/{_uid()}/{MC_LABEL}")
+        ok = True
+    if ok:
+        mcconfig.clear_cache()
+        log("  ✓ capture daemon running")
+    return ok
+
+
+def _permissions(mc: str, log, todo: list, done: list) -> None:
+    """The recorder's two permissions, as meeting-capture asks for them
+    (`check --request screen_audio`, then `microphone`; ≥ 0.8) and words
+    their fixes (each row's per-channel hint). meeting-capture 0.7: the
+    sysaudio steps, by hand."""
+    first = owners.call("meeting-capture", "check", "--json", schema="meeting-capture.permissions/", exe=mc,
+                        timeout=60)
+    if first["status"] == "old":
+        _legacy_permission_steps(log, todo, done)
+        return
+    if first["status"] != "ok" or not first["data"].get("ok"):
+        err = first.get("error") or ((first.get("data") or {}).get("error") or {}).get("message")
+        log(f"  ✗ couldn't ask meeting-capture for the permissions: {err}")
+        todo.append("Check the recorder's permissions: meeting-capture check")
+        return
+    doc = first["data"]
+    for perm in ("screen_audio", "microphone"):
+        row = next((r for r in doc.get("permissions") or [] if r.get("id") == perm), None)
+        if row and row.get("status") == "not_determined" and row.get("can_request") and _interactive():
+            asked = owners.call("meeting-capture", "check", "--json", "--request", perm,
+                                schema="meeting-capture.permissions/", exe=mc, timeout=300)
+            if asked["status"] == "ok" and asked["data"].get("ok"):
+                doc = asked["data"]
+    missing = []
+    for row in doc.get("permissions") or []:
+        title = {"screen_audio": "Screen & System Audio Recording", "microphone": "Microphone"}.get(row["id"],
+                                                                                                     row["id"])
+        if row.get("status") == "granted":
+            log(f"  ✓ {title}")
+        elif row.get("required"):
+            log(f"  ✗ {title}: {row.get('status')}" + (f" — {row['hint']}" if row.get("hint") else ""))
+            missing.append((title, row))
+    if not missing:
+        done.append("Permissions")
+        return
+    if _interactive():
+        for title, row in missing:
+            if row.get("settings_url"):
+                _run(["open", row["settings_url"]])
+        input("\n  Press Enter when they are allowed… ")
+        again = owners.call("meeting-capture", "check", "--json", schema="meeting-capture.permissions/", exe=mc,
+                            timeout=60)
+        rows = ((again.get("data") or {}).get("permissions") or []) if again["status"] == "ok" else []
+        still = [r for r in rows if r.get("required") and r.get("status") != "granted"]
+        if not still and rows:
+            done.append("Permissions")
+            return
+    for title, row in missing:
+        todo.append(f"Allow {title}: {row.get('hint') or 'System Settings › Privacy & Security'}")
+
+
+def _legacy_permission_steps(log, todo: list, done: list) -> None:
+    """meeting-capture 0.7 (no `check --json`): the manual sysaudio steps."""
+    sysaudio = mcconfig.agent().get("sysaudio") or ""
     if sysaudio:
         subprocess.run(["pbcopy"], input=sysaudio, text=True)
         log("  The sysaudio path is on your clipboard:")
@@ -741,37 +907,169 @@ def setup(log=print) -> bool:
     if _interactive():
         _run(["open", TCC_PANE])
         input("\n  Press Enter when sysaudio is added and turned on… ")
-        _launchctl("kickstart", "-k", f"gui/{_uid()}/com.contorch.meeting-capture")
         done.append("Screen & System Audio Recording (granted by you; confirmed on your first call)")
     else:
         todo.append(f"Grant Screen & System Audio Recording to {sysaudio or 'sysaudio'}")
 
-    # 7. Menu bar
-    step("Menu bar")
-    brew = shutil.which("brew")
-    if brew and _run([brew, "list", "--versions", "contorch"]).returncode == 0:
-        res = _run([brew, "services", "restart", "contorch/tap/contorch"], timeout=120)
-        log("  ✓ ○ is in your menu bar (starts at login)" if res.returncode == 0
-            else "  ! could not start it: brew services start contorch/tap/contorch")
-        if res.returncode != 0:
-            todo.append("Start the menu bar: brew services start contorch/tap/contorch")
-    else:
-        log("  · not installed via Homebrew — start the menu bar with: pipeline-monitor &")
 
+def _can_transcribe(mc: str) -> bool | None:
+    """Will anything transcribe what the recorder records? On-device (now or
+    once its model is downloaded) or a Gemini key Google didn't reject —
+    from meeting-capture's own answer. None: it couldn't say."""
+    view = stt.fresh(mc)
+    if view["status"] == "old":
+        return _key_file_has_key() and KEY_VERDICT["key"] != "rejected"
+    d = view.get("data")
+    if not d:
+        return None
+    a = d.get("apple") or {}
+    if a.get("usable") or a.get("installable"):
+        return True
+    return bool(d.get("gemini_key")) and KEY_VERDICT["key"] != "rejected"
+
+
+def _menu_bar(log, todo: list, me: str) -> None:
+    if me == "brew":
+        brew = shutil.which("brew") or next((str(Path(p) / "bin" / "brew") for p in owners.BREW_PREFIXES
+                                             if (Path(p) / "bin" / "brew").exists()), None)
+        if brew and _run([brew, "list", "--versions", "contorch"]).returncode == 0:
+            res = _run([brew, "services", "restart", "contorch/tap/contorch"], timeout=120)
+            log("  ✓ ○ is in your menu bar (starts at login)" if res.returncode == 0
+                else "  ! could not start it: brew services start contorch/tap/contorch")
+            if res.returncode != 0:
+                todo.append("Start the menu bar: brew services start contorch/tap/contorch")
+            return
+    if me == "app":
+        log("  · Contorch.app starts itself at login (System Settings › General › Login Items)")
+        try:
+            from .notify import request_authorization
+            request_authorization()            # asked once, here
+        except ImportError:
+            pass
+        return
+    log("  · not installed via Homebrew — start the menu bar with: pipeline-monitor &")
+
+
+def setup(log=print, record: str | None = None, linein: str | None = None, cli: str | None = None,
+          embeddings: str | None = None) -> bool:
+    """Everything scriptable, in order, then an honest list of what is left.
+
+    Resumable and idempotent: every step asks the owner what is there before
+    changing it, so a closed Terminal is recovered by running it again. The
+    channel guard is asked first; the marker is claimed at the end."""
+    todo: list[str] = []
+    done: list[str] = []
+    KEY_VERDICT["key"] = None
+    me = owners.channel()
+
+    def step(title: str) -> None:
+        log(f"\n▶ {title}")
+
+    step("Checking this Mac")
+    guard = chan.check(me)
+    if not guard["ok"]:
+        log(f"  ✗ {guard['message']}")
+        return False
+    warn = owners.channel_warning()
+    if warn:
+        log(f"  ! {warn}")
+    if not owners.locate("contorch-memory") or not owners.locate("contorch-mcp"):
+        log("  ✗ Contorch's memory (context-orchestrator) isn't installed")
+        log("    Install it with: brew install contorch/tap/contorch")
+        return False
+    mc = owners.locate("meeting-capture")
+    log("  ✓ memory (context-orchestrator)")
+    log(f"  {'✓' if mc else '·'} meeting recorder (meeting-capture)" + ("" if mc else " — not installed"))
+    if not shutil.which("claude"):
+        log("  ! Claude Code not found — meetings will be kept but not connected to Claude yet")
+
+    step("What should Contorch do on this Mac?")
+    want = _choose_modules(log, me, mc, record, linein, cli)
+
+    before = modules.wanted() or modules.infer_wanted(modules.observe(me)) or {}
+    stt_cmd = None
+    if want["recorder"] and mc:
+        step("Transcription")
+        stt_cmd = _choose_transcription(log, todo, mc)
+        if not before.get("recorder") and _can_transcribe(mc) is False:
+            # macOS 15 with no accepted key: nothing would transcribe it, so a
+            # new recorder stays off (modules.plan holds it). An existing one
+            # keeps recording; its audio waits for a key, as before.
+            held = modules.plan(enable=["recorder"], ch=me, can_transcribe=False).get("held") or {}
+            log(f"  · the recorder stays off: {modules.NO_ENGINE_TEXT}")
+            want["recorder"] = want["linein"] = False
+            todo.append(f"Meeting recorder: {modules.NO_ENGINE_TEXT}, then run contorch setup again"
+                        + (f" ({held['code']})" if held.get("code") else ""))
+            stt_cmd = None
+
+    step("Search embeddings")
+    if want["recorder"]:
+        _setup_embeddings(log, todo, done, choice=None if embeddings in (None, "imported") else embeddings)
+    else:
+        _memory_only_embeddings(log, todo, done, embeddings)
+
+    step("Search index")
+    if not _search_index(log, todo, done):
+        return False
+    _selftest(log, todo)
+
+    step("Claude Code connection")
+    _claude_code(log, todo, done, me, want["recorder"])
+
+    if want["recorder"] and mc:
+        step("Meeting capture")
+        if not _install_recorder(mc, log):
+            return False
+        _apply_stt(stt_cmd, log, todo)
+        _report_transcription(mc, log, todo, done)
+        if want["linein"]:
+            log("  · choose your audio interface and its inputs on the Recording settings page "
+                "(menu bar › Recording settings…, or `meeting-capture ui`)")
+
+        step("Permissions (macOS asks you; nothing can grant them for you)")
+        _permissions(mc, log, todo, done)
+        restarted = _agent(mc, "restart", log)
+        if restarted is None:                        # meeting-capture 0.7
+            _launchctl("kickstart", "-k", f"gui/{_uid()}/{MC_LABEL}")
+    elif mc:
+        if before.get("recorder") and mcconfig.installed():
+            step("Meeting capture")
+            ok = _agent(mc, "uninstall", log)
+            if ok is None:
+                ok = _run([mc, "uninstall"]).returncode == 0
+            log("  ✓ the recorder is off on this Mac" if ok else "  ✗ couldn't remove the recorder agent")
+            if not ok:
+                todo.append("Turn the recorder off: meeting-capture uninstall")
+
+    if me == "app":
+        if want.get("cli"):
+            res = modules.cli_install()
+            log(f"  ✓ commands linked into {res.get('dir')}" if res.get("ok") else
+                f"  ✗ {res.get('error', {}).get('message')}")
+        else:
+            modules.cli_uninstall()
+
+    step("Menu bar")
+    _menu_bar(log, todo, me)
+
+    modules._write(want)
+    claimed = chan.claim(me)
+    if not claimed["ok"]:
+        todo.append(claimed.get("message") or "Contorch is owned by another install here")
     STOPPED_MARKER.unlink(missing_ok=True)
 
-    # 8. Truth
     log("\n" + "─" * 60)
     for d in done:
         log(f"  ✓ {d}")
-    for t in todo:
-        log(f"  ✗ {t}")
+    for t_ in todo:
+        log(f"  ✗ {t_}")
     log("\nNext:")
-    if claude:
-        log("  1. Restart Claude Code so it loads the contorch MCP server.")
-    log("  2. Join a short call and say something. Then: meeting-capture last")
-    if claude:
+    log("  1. Restart Claude Code so it loads the contorch MCP server.")
+    if want["recorder"]:
+        log("  2. Join a short call and say something. Then: meeting-capture last")
         log("  3. In Claude Code ask: “Search contorch for my latest meeting. Cite the transcript.”")
+    else:
+        log("  2. Import transcripts from your recording Mac: menu bar › Import transcripts…")
     log("\n  Health check any time: contorch doctor · Pause everything: contorch stop")
     return not todo
 

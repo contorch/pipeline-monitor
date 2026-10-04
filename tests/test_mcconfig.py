@@ -25,7 +25,7 @@ def test_reads_config_json_and_caches_until_a_watched_file_changes(tmp_path, fak
     assert mcconfig.setting("mode") == "live" and mcconfig.setting("source") == "linein"
     assert mcconfig.setting("stt", "auto") == "auto"
     assert mcconfig.installed() and mcconfig.agent()["sysaudio"] == "/x/sysaudio"
-    assert fake_mc.changes() == [["config", "--json"]]           # one read, cached
+    assert [c for c in fake_mc.calls() if c[0] == "config"] == [["config", "--json"]]   # one read, cached
     doc["settings"]["mode"]["value"] = "batch"
     fake_mc.set(lines={"config --json": [json.dumps(doc)]})
     assert mcconfig.setting("mode") == "live"                    # nothing watched changed
@@ -40,9 +40,9 @@ def test_meeting_capture_0_7_falls_back_to_the_plist(tmp_path, fake_mc):
     assert mcconfig.setting("mode") == "live" and mcconfig.installed()
     assert mcconfig.agent() == {"backend": "launchctl", "installed": True, "sysaudio": "/o/sysaudio",
                                 "plist": str(mcconfig.LEGACY_PLIST), "legacy": True}
-    n = len(fake_mc.changes())
+    n = len(fake_mc.calls())
     mcconfig.setting("source")
-    assert len(fake_mc.changes()) == n                           # an old owner isn't asked every refresh
+    assert len(fake_mc.calls()) == n                           # an old owner isn't asked every refresh
 
 
 def test_no_meeting_capture():

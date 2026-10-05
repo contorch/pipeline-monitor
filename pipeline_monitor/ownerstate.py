@@ -142,7 +142,9 @@ def clear() -> None:
 
 # ------------------------------------------------------------------ what to show
 
-PERMISSION_TITLES = {"screen_audio": "Screen & System Audio Recording", "microphone": "Microphone"}
+PERMISSION_TITLES = {"screen_audio": "Screen & System Audio Recording",
+                     "system_audio": "System Audio Recording Only",   # meeting-capture's taps backend
+                     "microphone": "Microphone"}
 
 
 def permission_problems(doc: dict | None) -> list[dict]:

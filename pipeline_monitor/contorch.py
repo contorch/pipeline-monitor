@@ -933,10 +933,14 @@ def _install_recorder(mc: str, log) -> bool:
 
 
 def _permissions(mc: str, log, todo: list, done: list) -> None:
-    """The recorder's two permissions, as meeting-capture asks for them
-    (`check --request screen_audio`, then `microphone`; ≥ 0.8) and words
-    their fixes (each row's per-channel hint). meeting-capture 0.7: the
-    sysaudio steps, by hand."""
+    """The recorder's permissions, as meeting-capture asks for them and words
+    their fixes (each row's per-channel hint; ≥ 0.8). Every row the recorder
+    needs (`required`) that macOS can still ask about (`can_request`) is
+    requested in meeting-capture's order: Screen & System Audio Recording or
+    System Audio Recording Only (whichever its capture backend needs), then
+    the microphone. Only undecided rows are asked ("unknown" = sysaudio can
+    ask but can't read the state first). meeting-capture 0.7: the sysaudio
+    steps, by hand."""
     first = owners.call("meeting-capture", "check", "--json", schema="meeting-capture.permissions/", exe=mc,
                         timeout=60)
     if first["status"] == "old":
@@ -948,17 +952,19 @@ def _permissions(mc: str, log, todo: list, done: list) -> None:
         todo.append("Check the recorder's permissions: meeting-capture check")
         return
     doc = first["data"]
-    for perm in ("screen_audio", "microphone"):
+    order = [r.get("id") for r in doc.get("permissions") or [] if r.get("id")]
+    for perm in order:
         row = next((r for r in doc.get("permissions") or [] if r.get("id") == perm), None)
-        if row and row.get("status") == "not_determined" and row.get("can_request") and _interactive():
+        if (row and row.get("required") and row.get("can_request")
+                and row.get("status") in ("not_determined", "unknown") and _interactive()):
             asked = owners.call("meeting-capture", "check", "--json", "--request", perm,
                                 schema="meeting-capture.permissions/", exe=mc, timeout=300)
             if asked["status"] == "ok" and asked["data"].get("ok"):
                 doc = asked["data"]
     missing = []
     for row in doc.get("permissions") or []:
-        title = {"screen_audio": "Screen & System Audio Recording", "microphone": "Microphone"}.get(row["id"],
-                                                                                                     row["id"])
+        from .ownerstate import PERMISSION_TITLES
+        title = PERMISSION_TITLES.get(row["id"], row["id"])
         if row.get("status") == "granted":
             log(f"  ✓ {title}")
         elif row.get("required"):

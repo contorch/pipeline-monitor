@@ -28,6 +28,7 @@ from PyObjCTools import AppHelper  # noqa: F401  (ensures AppKit init order)
 from . import channel as chan
 from . import contorch as ct
 from . import mcconfig, modules, owners
+from . import source as src
 from . import status as st
 from . import transcription as stt
 
@@ -254,6 +255,27 @@ def _attention_lines(snap: st.Snapshot) -> list[rumps.MenuItem]:
     return [rumps.MenuItem(f"⚠ {words.get(a['code'], a['code'])}") for a in items]
 
 
+def _build_source_line(snap: st.Snapshot, on_click=None) -> rumps.MenuItem | None:
+    """'Source: this Mac's call audio' / 'Source: line-in — UMC404HD 192k (Me
+    in 1 · Them in 2)' / '⚠ Source: UMC404HD 192k not connected — recording
+    this Mac instead | not recording', as meeting-capture reports it
+    (pipeline_monitor.source). A click opens Recording settings…"""
+    s = snap.source or {}
+    line = src.text(s, (snap.recording or {}).get("recording"))
+    if not line:
+        return None
+    if src.warn(s, (snap.recording or {}).get("recording")):
+        since = src.problem_since(s)
+        line = f"⚠ {line}" + (f" (since {since})" if since else "")
+    return rumps.MenuItem(_truncate(line, 110), callback=on_click)
+
+
+def _source_details(snap: st.Snapshot) -> list[str]:
+    s = snap.source or {}
+    line = src.text(s, (snap.recording or {}).get("recording"))
+    return ([line] if line else []) + src.details(s)
+
+
 def _build_transcription_line(snap: st.Snapshot) -> rumps.MenuItem | None:
     """'Transcription: on this Mac (en-US)' / 'Gemini' / '⚠ … unavailable — why',
     with ' · live: calls stream to Gemini' while live mode uploads every call,
@@ -447,6 +469,8 @@ def _build_details_submenu(snap: st.Snapshot) -> rumps.MenuItem:
         submenu.add(rumps.MenuItem(f"Module {row['title']}: {row['state']}"))
     for line in _transcription_details(snap):
         submenu.add(rumps.MenuItem(line))
+    for line in _source_details(snap):
+        submenu.add(rumps.MenuItem(_truncate(line, 120)))
 
     # SQLite breakdown
     d = snap.db
@@ -663,6 +687,7 @@ class PipelineMonitor(rumps.App):
             self._has_icons = False
 
         self._snap: Optional[st.Snapshot] = None
+        self._outage = src.OutageNotifier()      # one notification per line-in outage
         self._pulse_phase = 0  # 0 = base glyph, 1 = bolder pulse glyph
         self._is_pulsing = False
 
@@ -720,6 +745,21 @@ class PipelineMonitor(rumps.App):
             stt.clear_cache()
         self._snap = st.collect()
         self._repaint()
+        self._notify_source(self._snap)
+
+    def _notify_source(self, snap: st.Snapshot) -> None:
+        """The configured line-in interface went missing: say so once per
+        outage (the menu keeps saying it while it lasts)."""
+        try:
+            if not snap.recorder_on() or ct.is_stopped():
+                return
+            note = self._outage.check(snap.source or {}, (snap.recording or {}).get("recording"))
+        except Exception as e:  # noqa: BLE001
+            _log(f"[source] {e!r}")
+            return
+        if note:
+            _log(f"[source] {note[0]}: {note[1]}")
+            _notify("Contorch", *note)
 
     def _on_refresh_now(self, _):
         from . import ownerstate
@@ -1117,6 +1157,9 @@ class PipelineMonitor(rumps.App):
         if recorder:
             for line in _permission_lines(snap):
                 self.menu.add(line)
+            sline = _build_source_line(snap, self._on_recording_settings)
+            if sline is not None:
+                self.menu.add(sline)
             tline = _build_transcription_line(snap)
             if tline is not None:
                 self.menu.add(tline)

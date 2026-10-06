@@ -1263,6 +1263,9 @@ def doctor() -> int:
     snap = st.collect(wait=True)
     if snap.recorder_on():
         rc = _print_transcription_detail() or rc
+        print("\n── audio source (meeting-capture)")
+        if _print_source(snap, doctor=True):
+            rc = 1
         print("\n── permissions (meeting-capture check)")
         perms = snap.permissions
         if perms.get("source") == "log":
@@ -1331,6 +1334,28 @@ HEADLINES = {"needs_setup": "Contorch isn't set up on this Mac yet — run `cont
              "idle": "○ Idle — ready to record"}
 
 
+def _print_source(snap, doctor: bool = False) -> bool:
+    """`source  line-in — UMC404HD 192k (Me in 1 · Them in 2)` / `⚠ UMC404HD
+    192k not connected — not recording (since 10:37)`, as meeting-capture
+    reports it (pipeline_monitor.source). Returns whether there is a problem."""
+    from . import source as src
+    s = snap.source or {}
+    line = src.text(s, (snap.recording or {}).get("recording"))
+    if not line:
+        return False
+    body = line.removeprefix("Source: ")
+    if src.warn(s, (snap.recording or {}).get("recording")):
+        since = src.problem_since(s)
+        body = f"⚠ {body}" + (f" (since {since})" if since else "")
+    if doctor:
+        print(f"  {'✗' if s.get('problem') else '✓'} source: {body.removeprefix('⚠ ')}")
+        for d in src.details(s):
+            print(f"    {d.strip()}")
+    else:
+        print(f"  {'source':<24} {body}")
+    return bool(s.get("problem"))
+
+
 def _print_status(transcription: bool = True) -> int:
     """The headline, the modules, what runs, the memory and the
     transcription engine — from the owners' answers (status.collect)."""
@@ -1360,6 +1385,7 @@ def _print_status(transcription: bool = True) -> int:
                 print(f"  {'recorder':<24} {state}")
         for p in snap.permissions.get("problems") or []:
             print(f"  {'':<24} ⚠ {p['title']}: {p['status']}" + (f" — {p['hint']}" if p.get("hint") else ""))
+        _print_source(snap)
     else:
         print(f"  {'background':<24} nothing runs")
     for row in status():                       # retired agents an older install left behind

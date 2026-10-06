@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import mcconfig, modules, owners, ownerstate
+from . import source as src_mod
 from . import transcription as stt
 
 HOME = Path.home()
@@ -653,6 +654,7 @@ class Snapshot:
     disk: dict[str, Any] = field(default_factory=dict)
     transcription: dict[str, Any] = field(default_factory=dict)
     modules: dict[str, Any] = field(default_factory=dict)
+    source: dict[str, Any] = field(default_factory=dict)
 
     def recorder_on(self) -> bool:
         """Does this Mac record (the recorder module is on, or — before any
@@ -688,6 +690,7 @@ class Snapshot:
           - the memory (context-orchestrator's status says not ok)
           - the recorder's agent isn't running while it should
           - nothing can transcribe (meeting-capture's `stt --json`)
+          - the configured line-in interface is missing (source.status)
           - MCP's most recent tool call failed in the last hour
         A memory-only Mac has no recorder to complain about.
         """
@@ -700,6 +703,10 @@ class Snapshot:
         if self.memory and not self.memory.get("ok", True):
             problems.append("memory")
         if recorder:
+            if (self.source or {}).get("problem"):
+                # The configured line-in interface can't be used and nothing
+                # is recorded from it (a fallback recording is ● REC above).
+                problems.append("source")
             for label, info in self.launchd.get("daemons", {}).items():
                 if label.endswith("meeting-capture") and info.get("installed") and not info.get("running"):
                     problems.append("recorder")
@@ -736,6 +743,7 @@ def collect(wait: bool = False) -> Snapshot:
         disk=disk_status(),
         transcription=transcription_status(wait=wait),
         modules=mods,
+        source=src_mod.status(wait=wait, log_path=MEETING_CAPTURE_LOG) if recorder_present else {},
     )
 
 
@@ -755,4 +763,5 @@ if __name__ == "__main__":
         "hook": snap.hook,
         "disk": snap.disk,
         "transcription": snap.transcription,
+        "source": snap.source,
     }, indent=2, default=str))

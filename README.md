@@ -14,7 +14,7 @@ Glanceable state in the menu bar — `○` idle / `● REC` recording / `⚠` so
 
 | Section | Data |
 |---|---|
-| **NOW** | Recording state + current meeting (from the meeting-capture daemon log) · **Transcription:** `on this Mac (en-US)` / `Gemini` / `⚠ unavailable — <reason>`, as meeting-capture reports it (details: setting, locale, on-device state, key, where audio goes) |
+| **NOW** | Recording state + current meeting (from the meeting-capture daemon log) · **Source:** `this Mac's call audio` / `line-in — UMC404HD 192k (Me in 1 · Them in 2)` / `⚠ UMC404HD 192k not connected — not recording` (since HH:MM; meeting-capture 0.7.0) / `… — will record this Mac's calls instead` / `… — recording this Mac instead` (meeting-capture 0.7.1's line-in fallback), from the recorder's settings (its launchd plist) and the running daemon's `line-in capture unavailable` / `line-in fallback` lines in its log. A missing interface turns the icon ⚠ while nothing is recorded and posts one notification per outage; a click opens Recording settings…; `contorch status` and `doctor` show the same · **Transcription:** `on this Mac (en-US)` / `Gemini` / `⚠ unavailable — <reason>`, as meeting-capture reports it (details: setting, locale, on-device state, key, where audio goes) |
 | **RECENT SESSIONS** | Last 10 transcripts (from the context-orchestrator database; legacy `~/transcripts/*.md` too). Each has **Copy transcript** (whole text to the clipboard) and **Open in TextEdit**. |
 | **INDEX HEALTH** | Chroma doc count + embedding dim · SQLite tasks/sources/insights · last insight age |
 | **MCP / CONNECTIONS** | MCP server activity · last tool call (tool, result, latency, ago) · auto-context hook last fire (ago + latency + chars injected) · expandable timeline of last 20 calls |

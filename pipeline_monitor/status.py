@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 import httpx
 
+from . import source as src_mod
 from . import transcription as stt
 
 HOME = Path.home()
@@ -607,6 +608,20 @@ def disk_status() -> dict[str, Any]:
     return out
 
 
+# ----------------------------------------------------------- audio source
+
+def source_status(launchd: dict[str, Any]) -> dict[str, Any]:
+    """Where the recorder's audio comes from and whether that works
+    (pipeline_monitor.source: meeting-capture 0.7's plist + daemon log).
+    {} without the recorder's launchd agent (the menu leaves the line out)."""
+    if not MEETING_CAPTURE_PLIST.exists():
+        return {}
+    d = next((info for label, info in (launchd.get("daemons") or {}).items()
+              if label.endswith("meeting-capture")), {}) if launchd.get("ok") else {}
+    return src_mod.status(daemon_pid=d.get("pid"), daemon_running=bool(d.get("running")) or not launchd.get("ok"),
+                          log_path=MEETING_CAPTURE_LOG, plist=MEETING_CAPTURE_PLIST)
+
+
 # ----------------------------------------------------------- composite
 
 @dataclass
@@ -624,6 +639,7 @@ class Snapshot:
     disk: dict[str, Any] = field(default_factory=dict)
     embeddings: dict[str, Any] = field(default_factory=dict)
     transcription: dict[str, Any] = field(default_factory=dict)
+    source: dict[str, Any] = field(default_factory=dict)
 
     def overall(self) -> str:
         """State for the menu bar icon: rec / rec_stale / perm / err / ok.
@@ -634,6 +650,7 @@ class Snapshot:
           - MCP server has a recent tool-call failure (not just idle)
           - nothing can transcribe (meeting-capture's `stt --json` says not
             ready): meetings are recorded but stay untranscribed
+          - the configured line-in interface is missing (source.status)
         We deliberately do NOT flag MCP as 'err' just because it hasn't
         seen a tool call recently — Claude Code might just not be open.
         """
@@ -659,6 +676,10 @@ class Snapshot:
                 problems.append(label.split(".")[-1])
         if self.transcription.get("ok") and self.transcription.get("attention"):
             problems.append("transcription")
+        if (self.source or {}).get("problem"):
+            # The configured line-in interface can't be used and nothing is
+            # recorded from it (a fallback recording is ● REC above).
+            problems.append("source")
         # Only flag MCP if its MOST RECENT call failed (active problem),
         # not if it's been idle.
         last_call = self.mcp.get("last_call")
@@ -678,11 +699,12 @@ class Snapshot:
 def collect(wait: bool = False) -> Snapshot:
     """Run every collector and return a snapshot. Each call is sub-second
     (meeting-capture is asked in the background unless wait=True)."""
+    launchd = launchd_status()
     return Snapshot(
         chroma=chroma_status(),
         db=db_status(),
         mcp=mcp_status(),
-        launchd=launchd_status(),
+        launchd=launchd,
         recordings=recordings_status(),
         recording=recording_status(),
         capture_mode=capture_mode_status(),
@@ -690,6 +712,7 @@ def collect(wait: bool = False) -> Snapshot:
         disk=disk_status(),
         embeddings=embeddings_status(),
         transcription=transcription_status(wait=wait),
+        source=source_status(launchd),
     )
 
 
@@ -708,4 +731,5 @@ if __name__ == "__main__":
         "hook": snap.hook,
         "disk": snap.disk,
         "transcription": snap.transcription,
+        "source": snap.source,
     }, indent=2, default=str))

@@ -800,6 +800,12 @@ def _print_transcription_detail() -> int:
 def doctor() -> int:
     rc = _print_status(transcription=False)
     rc = _print_transcription_detail() or rc
+    from . import status as st
+    snap = st.Snapshot(source=st.source_status(st.launchd_status()), recording=st.recording_status())
+    if snap.source:
+        print("\n── audio source (meeting-capture)")
+        if _print_source(snap, doctor=True):
+            rc = 1
     for name in ("meeting-capture", "transcript-watcher"):
         b = shutil.which(name)
         if not b:
@@ -817,6 +823,28 @@ def doctor() -> int:
 
 
 # ------------------------------------------------------------------ CLI
+
+def _print_source(snap, doctor: bool = False) -> bool:
+    """`source  line-in — UMC404HD 192k (Me in 1 · Them in 2)` / `⚠ UMC404HD
+    192k not connected — not recording (since 10:37)`, as meeting-capture
+    reports it (pipeline_monitor.source). Returns whether there is a problem."""
+    from . import source as src
+    s = snap.source or {}
+    line = src.text(s, (snap.recording or {}).get("recording"))
+    if not line:
+        return False
+    body = line.removeprefix("Source: ")
+    if src.warn(s, (snap.recording or {}).get("recording")):
+        since = src.problem_since(s)
+        body = f"⚠ {body}" + (f" (since {since})" if since else "")
+    if doctor:
+        print(f"  {'✗' if s.get('problem') else '✓'} source: {body.removeprefix('⚠ ')}")
+        for d in src.details(s):
+            print(f"    {d.strip()}")
+    else:
+        print(f"  {'source':<24} {body}")
+    return bool(s.get("problem"))
+
 
 def _print_status(transcription: bool = True) -> int:
     rows = status()
@@ -842,6 +870,15 @@ def _print_status(transcription: bool = True) -> int:
             print(f"  {'':<24} audio: {t['privacy']}" + (f" ({t['privacy_fix']})" if t["privacy_fix"] else ""))
         if t["note"]:
             print(f"  {'':<24} ! {t['note']}")
+    try:
+        from . import status as st
+        snap = st.Snapshot(source=st.source_status(st.launchd_status()), recording=st.recording_status())
+        if snap.source:
+            if t is None:
+                print()
+            _print_source(snap)
+    except Exception as e:  # noqa: BLE001 — a status line must not break `status`
+        print(f"  {'source':<24} ? ({type(e).__name__}: {e})")
     return 0
 
 
